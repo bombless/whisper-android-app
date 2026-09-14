@@ -14,6 +14,14 @@ class QnnSmokeActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (intent.getBooleanExtra("encoder_smoke", false)) {
+            Thread {
+                val result = QnnEncoderSmokeRunner.run(this)
+                File(filesDir, "qnn-encoder-smoke-result.txt").writeText(result.report)
+                runOnUiThread { finish() }
+            }.start()
+            return
+        }
         statusView = TextView(this).apply {
             setTextColor(Color.WHITE)
             setBackgroundColor(Color.BLACK)
