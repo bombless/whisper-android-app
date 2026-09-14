@@ -22,6 +22,14 @@ class QnnSmokeActivity : Activity() {
             }.start()
             return
         }
+        if (intent.getBooleanExtra("decoder_smoke", false)) {
+            Thread {
+                val result = QnnDecoderSmokeRunner.run(this)
+                File(filesDir, "qnn-decoder-smoke-result.txt").writeText(result.report)
+                runOnUiThread { finish() }
+            }.start()
+            return
+        }
         statusView = TextView(this).apply {
             setTextColor(Color.WHITE)
             setBackgroundColor(Color.BLACK)
