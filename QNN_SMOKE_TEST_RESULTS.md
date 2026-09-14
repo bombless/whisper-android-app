@@ -106,3 +106,56 @@ APK: `app/build/outputs/apk/debug/app-debug.apk`.
 - `build/qnn-smoke-logcat-excerpt-before-fix.txt`: previous log excerpt.
 
 The project directory is not a Git repository, so there is no commit or Git diff for these local changes.
+
+## Whisper Encoder Context-Binary Checkpoint
+
+Date: 2026-09-15
+Status: **PASS on RMX3800 / SM8650 / HTP v75**
+
+Task M1.1/M1.2 is resolved without a custom QNN JNI graph bridge. The raw QAIRT context binary is consumed by ONNX Runtime QNN EP through an `EPContext` ONNX wrapper. The wrapper points to the external `encoder.bin` with `embed_mode=0`; the binary remains the existing 19,832,832-byte asset. ORT does not treat the raw `.bin` itself as an ONNX model; it loads it through an `EPContext` node.
+
+The generated wrapper is `app/src/main/assets/models/whisper/encoder_ctx.onnx` and names the compiled QNN graph `hf_whisper_encoder`. The test sets `backend_path` to the packaged `libQnnHtp.so`, `soc_model=57`, `htp_arch=75`, and disables CPU EP fallback.
+
+Physical-device execution result:
+
+```text
+Encoder execution: SUCCESS
+QNN EP: QNNExecutionProvider
+Backend: HTP
+SoC: SM8650 / soc_model=57 / HTP v75
+Context binary bytes: 19832832
+Session creation ms: 507.235469
+Execution ms: 4034.514478
+Input: input_features [1,80,3000] FP16
+NaN = 0
+Inf = 0
+```
+
+All eight Cross-KV outputs were returned with the required names, shapes, and FP16 dtype. Per-output statistics from the successful device run:
+
+| Output | Shape | Min | Max | Mean | NaN | Inf |
+|---|---|---:|---:|---:|---:|---:|
+| `k_cache_cross_0` | `[6,1,64,1500]` | -5.1757812 | 9.59375 | 0.01389316 | 0 | 0 |
+| `v_cache_cross_0` | `[6,1,1500,64]` | -2.1289062 | 2.3378906 | -0.01092271 | 0 | 0 |
+| `k_cache_cross_1` | `[6,1,64,1500]` | -4.5546875 | 4.8242188 | 0.02414179 | 0 | 0 |
+| `v_cache_cross_1` | `[6,1,1500,64]` | -2.7792969 | 2.4082031 | 0.02431508 | 0 | 0 |
+| `k_cache_cross_2` | `[6,1,64,1500]` | -5.9765625 | 6.2382812 | 0.00810283 | 0 | 0 |
+| `v_cache_cross_2` | `[6,1,1500,64]` | -2.7890625 | 4.4414062 | 0.00293152 | 0 | 0 |
+| `k_cache_cross_3` | `[6,1,64,1500]` | -6.2929688 | 6.7265625 | -0.03465347 | 0 | 0 |
+| `v_cache_cross_3` | `[6,1,1500,64]` | -3.171875 | 5.0195312 | -0.00325477 | 0 | 0 |
+
+The encoder-only checkpoint is complete. Decoder, audio, tokenizer, and full `transcribe()` work remain intentionally untouched.
+
+The direct-device reproduction path is:
+
+```powershell
+gradle.bat :app:assembleDebug
+adb -s <SM8650-device> install -r app/build/outputs/apk/debug/app-debug.apk
+adb -s <SM8650-device> shell am force-stop com.example.whisperapp
+adb -s <SM8650-device> shell am start -n com.example.whisperapp/.qnn.QnnSmokeActivity --ez encoder_smoke true
+Start-Sleep -Seconds 10
+adb -s <SM8650-device> shell run-as com.example.whisperapp cat files/qnn-encoder-smoke-result.txt
+adb -s <SM8650-device> logcat -d -s QNN_ENCODER_SMOKE:I '*:S'
+```
+
+The existing QNN Android runtime versions remain unchanged: ORT Android 1.27.0, Qualcomm QNN EP 2.6.0, and QNN runtime 2.50.0. The `encoder.bin` itself was generated with QAIRT 2.45.0 and successfully loaded on the target SM8650/v75 device.
