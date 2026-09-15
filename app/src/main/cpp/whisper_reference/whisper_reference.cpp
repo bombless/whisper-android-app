@@ -1,5 +1,7 @@
 #include "whisper_reference.h"
 #include "whisper.h"
+#include "ggml.h"
+#include "ggml-backend.h"
 
 #include <algorithm>
 #include <cmath>
@@ -41,6 +43,103 @@ std::vector<Pair> top_k(const float * logits, int vocab) {
     });
     out.resize(take);
     return out;
+}
+
+extern "C" const ggml_tensor * whisper_get_encoder_output(const whisper_context * ctx);
+
+std::string inspect_encoder_output(const whisper_context * ctx) {
+    const ggml_tensor * tensor = whisper_get_encoder_output(ctx);
+    std::ostringstream report;
+    report << "ENCODER_OUTPUT_START\\n";
+    DIAG_LOG("ENCODER_OUTPUT_START");
+    if (!tensor) {
+        report << "ENCODER_OUTPUT_UNAVAILABLE\\nENCODER_OUTPUT_END\\n";
+        DIAG_LOG("ENCODER_OUTPUT_UNAVAILABLE");
+        DIAG_LOG("ENCODER_OUTPUT_END");
+        return report.str();
+    }
+
+    const size_t elements = ggml_nelements(tensor);
+    report << "ENCODER_OUTPUT_SHAPE ne0=" << tensor->ne[0] << " ne1=" << tensor->ne[1]
+           << " ne2=" << tensor->ne[2] << " ne3=" << tensor->ne[3] << "\\n";
+    report << "ENCODER_OUTPUT_TYPE " << ggml_type_name(tensor->type) << "\\n";
+    report << "ENCODER_OUTPUT_ELEMENTS " << elements << "\\n";
+    report << "ENCODER_OUTPUT_CONTIGUOUS " << (ggml_is_contiguous(tensor) ? "true" : "false") << "\\n";
+    DIAG_LOG("ENCODER_OUTPUT_SHAPE ne0=%lld ne1=%lld ne2=%lld ne3=%lld",
+             static_cast<long long>(tensor->ne[0]), static_cast<long long>(tensor->ne[1]),
+             static_cast<long long>(tensor->ne[2]), static_cast<long long>(tensor->ne[3]));
+    DIAG_LOG("ENCODER_OUTPUT_TYPE %s", ggml_type_name(tensor->type));
+    DIAG_LOG("ENCODER_OUTPUT_ELEMENTS %zu", elements);
+    DIAG_LOG("ENCODER_OUTPUT_CONTIGUOUS %s", ggml_is_contiguous(tensor) ? "true" : "false");
+
+    if (tensor->type != GGML_TYPE_F32 && tensor->type != GGML_TYPE_F16) {
+        report << "ENCODER_OUTPUT_TYPE_UNSUPPORTED " << ggml_type_name(tensor->type) << "\\nENCODER_OUTPUT_END\\n";
+        DIAG_LOG("ENCODER_OUTPUT_TYPE_UNSUPPORTED %s", ggml_type_name(tensor->type));
+        DIAG_LOG("ENCODER_OUTPUT_END");
+        return report.str();
+    }
+
+    const size_t tensor_bytes = ggml_nbytes(tensor);
+    std::vector<uint8_t> cpu_buffer(tensor_bytes);
+    if (tensor_bytes != 0) {
+        ggml_backend_tensor_get(tensor, cpu_buffer.data(), 0, tensor_bytes);
+    }
+
+    size_t finite = 0;
+    size_t nan = 0;
+    size_t inf = 0;
+    double min_value = std::numeric_limits<double>::infinity();
+    double max_value = -std::numeric_limits<double>::infinity();
+    double sum = 0.0;
+    double sum_sq = 0.0;
+
+    for (size_t i = 0; i < elements; ++i) {
+        float value;
+        if (tensor->type == GGML_TYPE_F32) {
+            value = reinterpret_cast<const float *>(cpu_buffer.data())[i];
+        } else {
+            value = ggml_fp16_to_fp32(reinterpret_cast<const ggml_fp16_t *>(cpu_buffer.data())[i]);
+        }
+
+        if (std::isnan(value)) {
+            ++nan;
+        } else if (std::isinf(value)) {
+            ++inf;
+        } else {
+            ++finite;
+            const double v = static_cast<double>(value);
+            min_value = std::min(min_value, v);
+            max_value = std::max(max_value, v);
+            sum += v;
+            sum_sq += v * v;
+        }
+    }
+
+    const double mean = finite > 0 ? sum / static_cast<double>(finite) : std::numeric_limits<double>::quiet_NaN();
+    const double rms = finite > 0 ? std::sqrt(sum_sq / static_cast<double>(finite)) : std::numeric_limits<double>::quiet_NaN();
+    if (finite == 0) {
+        min_value = std::numeric_limits<double>::quiet_NaN();
+        max_value = std::numeric_limits<double>::quiet_NaN();
+    }
+
+    report << std::setprecision(9)
+           << "ENCODER_OUTPUT_MIN " << min_value << "\\n"
+           << "ENCODER_OUTPUT_MAX " << max_value << "\\n"
+           << "ENCODER_OUTPUT_MEAN " << mean << "\\n"
+           << "ENCODER_OUTPUT_RMS " << rms << "\\n"
+           << "ENCODER_OUTPUT_FINITE " << finite << "\\n"
+           << "ENCODER_OUTPUT_NAN " << nan << "\\n"
+           << "ENCODER_OUTPUT_INF " << inf << "\\n"
+           << "ENCODER_OUTPUT_END\\n";
+    DIAG_LOG("ENCODER_OUTPUT_MIN %.9g", min_value);
+    DIAG_LOG("ENCODER_OUTPUT_MAX %.9g", max_value);
+    DIAG_LOG("ENCODER_OUTPUT_MEAN %.9g", mean);
+    DIAG_LOG("ENCODER_OUTPUT_RMS %.9g", rms);
+    DIAG_LOG("ENCODER_OUTPUT_FINITE %zu", finite);
+    DIAG_LOG("ENCODER_OUTPUT_NAN %zu", nan);
+    DIAG_LOG("ENCODER_OUTPUT_INF %zu", inf);
+    DIAG_LOG("ENCODER_OUTPUT_END");
+    return report.str();
 }
 
 std::string run_reference(const int16_t * samples, size_t sample_count, const std::string & model_path, int threads) {
@@ -187,10 +286,10 @@ std::string run_encoder_diagnostic(const int16_t * samples, size_t sample_count,
         const auto encoder_ms = std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - encoder_start).count();
         DIAG_LOG("ENCODER_DONE rc=%d elapsed_ms=%lld", rc, static_cast<long long>(encoder_ms));
         if (rc != 0) { DIAG_LOG("ENCODER_TEST_END result=FAILED"); whisper_free(ctx); return "ENCODER_TEST_END result=FAILED\\n"; }
-        DIAG_LOG("ENCODER_OUTPUT unavailable");
+        const std::string output_report = inspect_encoder_output(ctx);
         DIAG_LOG("ENCODER_TEST_END result=SUCCESS");
         whisper_free(ctx);
-        return "ENCODER_TEST_END result=SUCCESS\\n";
+        return output_report + "ENCODER_TEST_END result=SUCCESS\\n";
     } catch (...) {
         whisper_free(ctx);
         DIAG_LOG("ENCODER_TEST_END result=FAILED");
