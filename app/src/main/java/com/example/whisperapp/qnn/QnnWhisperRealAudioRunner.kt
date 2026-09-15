@@ -111,6 +111,7 @@ object QnnWhisperRealAudioRunner {
             var selfKv = LinkedHashMap<String, OnnxTensor>()
             for (name in selfInNames) selfKv[name] = f16(env, selfShape(name), tensors)
             val attentionMask = f16(env, longArrayOf(1, 1, 1, 200), tensors)
+            val forcedValidationMode = requestedSteps > forcedPrompt.size
             var currentToken = forcedPrompt[0]
             var completedSteps = 0
             var eosReached = false
@@ -118,7 +119,7 @@ object QnnWhisperRealAudioRunner {
             val stepLines = mutableListOf<String>()
 
             for (step in 0 until requestedSteps) {
-                val inputToken = if (step < forcedPrompt.size) forcedPrompt[step] else currentToken
+                val inputToken = if (forcedValidationMode) forcedPrompt[step % forcedPrompt.size] else if (step < forcedPrompt.size) forcedPrompt[step] else currentToken
                 val stepStart = System.nanoTime()
                 val stepTensors = mutableListOf<OnnxTensor>()
                 val stepResult = runDecoderStep(
@@ -150,7 +151,7 @@ object QnnWhisperRealAudioRunner {
 
                 selfKv = stepResult.nextSelfKv
                 completedSteps++
-                if (step >= forcedPrompt.size - 1) {
+                if (!forcedValidationMode && step >= forcedPrompt.size - 1) {
                     if (nextToken == EOS_TOKEN) {
                         eosReached = true
                     } else {
