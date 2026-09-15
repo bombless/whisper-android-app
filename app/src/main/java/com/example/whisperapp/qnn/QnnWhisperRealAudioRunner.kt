@@ -21,6 +21,7 @@ object QnnWhisperRealAudioRunner {
     private const val EP_NAME = "QNNExecutionProvider"
     private const val EOS_TOKEN = 50257
     private const val MAX_STEPS = 16
+    private const val MAX_GENERATION_STEPS = 32
     private val forcedPrompt = intArrayOf(50258, 50259, 50359, 50363)
     private val crossNames = (0 until 4).flatMap { listOf("k_cache_cross_$it", "v_cache_cross_$it") }
     private val selfInNames = (0 until 4).flatMap { listOf("k_cache_self_${it}_in", "v_cache_self_${it}_in") }
@@ -30,8 +31,8 @@ object QnnWhisperRealAudioRunner {
     private data class DecoderStepResult(val logits: OnnxTensor, val nextSelfKv: LinkedHashMap<String, OnnxTensor>)
     private data class HalfStats(val min: Float, val max: Float, val mean: Double, val finite: Int, val nan: Int, val inf: Int, val nonZero: Int)
 
-    fun run(context: Context, pcm16: ShortArray, sampleRate: Int, requestedSteps: Int = MAX_STEPS): Result {
-        require(requestedSteps in 1..MAX_STEPS)
+    fun run(context: Context, pcm16: ShortArray, sampleRate: Int, requestedSteps: Int = MAX_STEPS, autoregressive: Boolean = false): Result {
+        require(if (autoregressive) requestedSteps in 1..(forcedPrompt.size + MAX_GENERATION_STEPS) else requestedSteps in 1..MAX_STEPS)
         require(sampleRate == WhisperFeatureExtractor.SAMPLE_RATE) { "Whisper expects 16000 Hz, got $sampleRate" }
         return try {
             Log.i(TAG, "START requestedSteps=$requestedSteps samples=${pcm16.size} sampleRate=$sampleRate")
@@ -39,7 +40,7 @@ object QnnWhisperRealAudioRunner {
             Log.i(TAG, "TOKENIZER_READY")
             val features = WhisperFeatureExtractor().extract(pcm16, sampleRate)
             Log.i(TAG, "MEL_READY shape=${features.shape.contentToString()}")
-            val output = runLoop(context, features.data, pcm16.size, sampleRate, tokenizer, requestedSteps)
+            val output = runLoop(context, features.data, pcm16.size, sampleRate, tokenizer, requestedSteps, autoregressive)
             Result(true, output.first, output.second, output.third)
         } catch (t: Throwable) {
             Log.e(TAG, "FAIL: ${t.javaClass.name}: ${t.message}", t)
@@ -47,7 +48,7 @@ object QnnWhisperRealAudioRunner {
         }
     }
 
-    private fun runLoop(context: Context, features: FloatArray, pcmSamples: Int, sampleRate: Int, tokenizer: WhisperTokenizer, requestedSteps: Int): Triple<String, IntArray, String> {
+    private fun runLoop(context: Context, features: FloatArray, pcmSamples: Int, sampleRate: Int, tokenizer: WhisperTokenizer, requestedSteps: Int, autoregressive: Boolean): Triple<String, IntArray, String> {
         val encoderModel = copyAsset(context, "models/whisper/encoder_ctx.onnx")
         val encoderBinary = copyAsset(context, "models/whisper/encoder.bin")
         val decoderModel = copyAsset(context, "models/whisper/decoder_ctx.onnx")
@@ -78,7 +79,9 @@ object QnnWhisperRealAudioRunner {
             }
             encoderOptions = makeOptions()
             decoderOptions = makeOptions()
+            Log.i(TAG, "ENCODER_SESSION_CREATE_START")
             encoderSession = env.createSession(encoderModel.absolutePath, encoderOptions)
+            Log.i(TAG, "ENCODER_SESSION_CREATE_DONE")
             decoderSession = env.createSession(decoderModel.absolutePath, decoderOptions)
 
             check(encoderSession.inputNames == setOf("input_features")) { "encoder inputs=${encoderSession.inputNames}" }
@@ -91,9 +94,13 @@ object QnnWhisperRealAudioRunner {
             val featureStats = floatStats(features)
             check(featureStats.nan == 0 && featureStats.inf == 0 && featureStats.nonZero > 0) { "feature stats=$featureStats" }
             val inputFeatures = f16FromFloat(env, features, longArrayOf(1, 80, 3000), tensors)
+            Log.i(TAG, "ENCODER_INPUT_READY shape=[1, 80, 3000] dtype=FP16")
+            Log.i(TAG, "ENCODER_OUTPUT_READY names=${encoderSession.outputNames}")
             val crossInputs = LinkedHashMap<String, OnnxTensor>()
             val encoderStart = System.nanoTime()
+            Log.i(TAG, "ENCODER_RUN_START")
             encoderSession.run(mapOf("input_features" to inputFeatures)).use { result ->
+                Log.i(TAG, "ENCODER_RUN_RETURN resultSize=${result.size()}")
                 check(result.size() == 8) { "encoder result size=${result.size()}" }
                 for (name in crossNames) {
                     val index = encoderSession.outputNames.toList().indexOf(name)
@@ -101,8 +108,10 @@ object QnnWhisperRealAudioRunner {
                     val out = result[index] as OnnxTensor
                     val shape = if (name.startsWith("k_")) longArrayOf(6, 1, 64, 1500) else longArrayOf(6, 1, 1500, 64)
                     val stats = halfStats(out.getShortBuffer())
+                    Log.i(TAG, "ENCODER_OUTPUT_READ $name shape=${shape.contentToString()} finite=${stats.finite} nan=${stats.nan} inf=${stats.inf}")
                     check(stats.nan == 0 && stats.inf == 0 && stats.nonZero > 0) { "$name invalid stats=$stats" }
                     crossInputs[name] = copyHalfTensor(env, out, shape, tensors)
+                    Log.i(TAG, "ENCODER_OUTPUT_FINITE $name=true")
                     Log.i(TAG, "ENCODER_CROSS $name shape=${shape.contentToString()} dtype=FP16 finite=${stats.finite} nan=${stats.nan} inf=${stats.inf}")
                 }
             }
@@ -111,9 +120,10 @@ object QnnWhisperRealAudioRunner {
             var selfKv = LinkedHashMap<String, OnnxTensor>()
             for (name in selfInNames) selfKv[name] = f16(env, selfShape(name), tensors)
             val attentionMask = f16(env, longArrayOf(1, 1, 1, 200), tensors)
-            val forcedValidationMode = requestedSteps > forcedPrompt.size
-            var currentToken = forcedPrompt[0]
+            val forcedValidationMode = !autoregressive
+            var currentToken = forcedPrompt.last()
             var completedSteps = 0
+            var generationStepsCompleted = 0
             var eosReached = false
             val generated = mutableListOf<Int>()
             val stepLines = mutableListOf<String>()
@@ -151,8 +161,13 @@ object QnnWhisperRealAudioRunner {
 
                 selfKv = stepResult.nextSelfKv
                 completedSteps++
-                if (!forcedValidationMode && step >= forcedPrompt.size - 1) {
+                if (!forcedValidationMode && step == forcedPrompt.size - 1) {
+                    currentToken = nextToken
+                }
+                if (!forcedValidationMode && step >= forcedPrompt.size) {
+                    generationStepsCompleted++
                     if (nextToken == EOS_TOKEN) {
+                        generated += nextToken
                         eosReached = true
                     } else {
                         generated += nextToken
@@ -192,6 +207,9 @@ object QnnWhisperRealAudioRunner {
                 appendLine("decoder_step_0: PASS")
                 appendLine("steps_requested: $requestedSteps")
                 appendLine("steps_completed: $completedSteps")
+                appendLine("generation_steps_requested: ${if (autoregressive) requestedSteps - forcedPrompt.size else 0}")
+                appendLine("autoregressive: $autoregressive")
+                appendLine("generation_steps_completed: $generationStepsCompleted")
                 appendLine("cross_kv_computed_once: true")
                 appendLine("cross_kv_finite: true")
                 appendLine("self_kv_recursive: true")
