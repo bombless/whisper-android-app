@@ -8,6 +8,8 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Button
+import android.content.Intent
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.material3.Card
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
@@ -18,6 +20,7 @@ import androidx.compose.ui.unit.dp
 
 @Composable
 fun MainScreen() {
+    val context = LocalContext.current
     var text by remember { mutableStateOf("") }
     var recording by remember { mutableStateOf(false) }
 
@@ -31,6 +34,24 @@ fun MainScreen() {
         Text("ASR: Whisper-Tiny")
         Text("TTS: MeloTTS-ZH")
         Spacer(Modifier.height(20.dp))
+        Button(
+            onClick = {
+                context.startActivity(Intent(context, com.example.whisperapp.qnn.LongAudioVerificationActivity::class.java))
+            },
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("Run Long Audio Verification")
+        }
+        Spacer(Modifier.height(8.dp))
+        Button(
+            onClick = {
+                context.startActivity(Intent(context, com.example.whisperapp.qnn.WhisperReferenceActivity::class.java))
+            },
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("Run Whisper 5-Step Comparison")
+        }
+        Spacer(Modifier.height(12.dp))
         Button(onClick = { recording = !recording }, modifier = Modifier.fillMaxWidth()) {
             Text(if (recording) "Stop Recording" else "Start Recording")
         }

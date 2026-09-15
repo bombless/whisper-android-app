@@ -40,6 +40,9 @@ object QnnWhisperRealAudioRunner {
             Log.i(TAG, "TOKENIZER_READY")
             val features = WhisperFeatureExtractor().extract(pcm16, sampleRate)
             Log.i(TAG, "MEL_READY shape=${features.shape.contentToString()}")
+            val melStats = floatStats(features.data)
+            LongAudioAppLogger.info("MEL_READY shape=${features.shape.contentToString()}")
+            LongAudioAppLogger.info("MEL_STATS min=${melStats.min} max=${melStats.max} mean=${melStats.mean} finite=${melStats.finite} nan=${melStats.nan} inf=${melStats.inf} nonZero=${melStats.nonZero}")
             val output = runLoop(context, features.data, pcm16.size, sampleRate, tokenizer, requestedSteps, autoregressive)
             Result(true, output.first, output.second, output.third)
         } catch (t: Throwable) {
@@ -108,6 +111,7 @@ object QnnWhisperRealAudioRunner {
                     val out = result[index] as OnnxTensor
                     val shape = if (name.startsWith("k_")) longArrayOf(6, 1, 64, 1500) else longArrayOf(6, 1, 1500, 64)
                     val stats = halfStats(out.getShortBuffer())
+                    LongAudioAppLogger.info("ENCODER_OUTPUT_STATS name=$name shape=${shape.contentToString()} min=${stats.min} max=${stats.max} mean=${stats.mean} finite=${stats.finite} nan=${stats.nan} inf=${stats.inf} nonZero=${stats.nonZero}")
                     Log.i(TAG, "ENCODER_OUTPUT_READ $name shape=${shape.contentToString()} finite=${stats.finite} nan=${stats.nan} inf=${stats.inf}")
                     check(stats.nan == 0 && stats.inf == 0 && stats.nonZero > 0) { "$name invalid stats=$stats" }
                     crossInputs[name] = copyHalfTensor(env, out, shape, tensors)
@@ -127,6 +131,7 @@ object QnnWhisperRealAudioRunner {
             var eosReached = false
             val generated = mutableListOf<Int>()
             val stepLines = mutableListOf<String>()
+            LongAudioAppLogger.info("DECODER_START")
 
             for (step in 0 until requestedSteps) {
                 val inputToken = if (forcedValidationMode) forcedPrompt[step % forcedPrompt.size] else if (step < forcedPrompt.size) forcedPrompt[step] else currentToken
@@ -147,6 +152,11 @@ object QnnWhisperRealAudioRunner {
                 check(logitsStats.nan == 0 && logitsStats.inf == 0) { "step=$step logits NaN=${logitsStats.nan} Inf=${logitsStats.inf}" }
                 val nextToken = argmaxHalf(stepResult.logits.getShortBuffer())
                 check(nextToken >= 0) { "step=$step argmax failed" }
+                val topK = topKHalf(stepResult.logits.getShortBuffer(), 5)
+                val eosLogit = halfAt(stepResult.logits.getShortBuffer(), EOS_TOKEN)
+                LongAudioAppLogger.info("QNN_COMPARE_STEP step=$step inputToken=$inputToken position=$step top1=$nextToken eosLogit=$eosLogit maxLogit=${topK.firstOrNull()?.second ?: Float.NaN}")
+                LongAudioAppLogger.info("QNN_COMPARE_TOPK step=$step ${topK.joinToString(" ") { pair -> "${pair.first}:${pair.second}" }}")
+                LongAudioAppLogger.info("DECODER_TOKEN step=$step tokenId=$nextToken inputToken=$inputToken")
 
                 var selfFinite = 0
                 var selfNan = 0
@@ -169,9 +179,12 @@ object QnnWhisperRealAudioRunner {
                     if (nextToken == EOS_TOKEN) {
                         generated += nextToken
                         eosReached = true
+                        LongAudioAppLogger.info("DECODER_GENERATED step=$step count=${generated.size} lastToken=$nextToken ids=${generated.take(20)}")
+                        LongAudioAppLogger.info("DECODER_EOS step=$step tokenId=$EOS_TOKEN")
                     } else {
                         generated += nextToken
                         currentToken = nextToken
+                        LongAudioAppLogger.info("DECODER_GENERATED step=$step count=${generated.size} lastToken=$nextToken ids=${generated.take(20)}")
                     }
                 }
                 val line = "STEP $step token_in=$inputToken position=$step logitsFinite=${logitsStats.finite} logitsMin=${logitsStats.min} logitsMax=${logitsStats.max} argmax=$nextToken selfKVFinite=$selfFinite selfKVNaN=$selfNan selfKVInf=$selfInf latencyMs=${(System.nanoTime() - stepStart) / 1_000_000.0}"
@@ -187,7 +200,11 @@ object QnnWhisperRealAudioRunner {
             }
 
             check(completedSteps >= 1) { "M3.5 requires decoder step 0 to complete" }
-            val decodedText = tokenizer.decode(generated.toIntArray())
+            val tokenizerInputIds = generated.toIntArray()
+            LongAudioAppLogger.info("TOKENIZER_CALL_IDS count=${tokenizerInputIds.size} ids=${tokenizerInputIds.contentToString()}")
+            val decodedText = tokenizer.decode(tokenizerInputIds)
+            LongAudioAppLogger.info("TOKENIZER_INPUT_IDS count=${tokenizerInputIds.size} ids=${tokenizerInputIds.contentToString()}")
+            LongAudioAppLogger.info("TOKENIZER_DECODED_TEXT text=\"$decodedText\"")
             val report = buildString {
                 appendLine("M3.5 status: PASS")
                 appendLine("audio: real PCM16")
@@ -336,6 +353,18 @@ object QnnWhisperRealAudioRunner {
 
     private fun halfStats(buffer: ShortBuffer): HalfStats { val c = buffer.duplicate(); var min = Float.POSITIVE_INFINITY; var max = Float.NEGATIVE_INFINITY; var sum = 0.0; var finite = 0; var nan = 0; var inf = 0; var nonZero = 0; while (c.hasRemaining()) { val v = halfToFloat(c.get().toInt() and 0xffff); when { v.isNaN() -> nan++; v.isInfinite() -> inf++; else -> { finite++; if (v < min) min = v; if (v > max) max = v; sum += v.toDouble(); if (v != 0f) nonZero++ } } }; return HalfStats(min, max, if (finite == 0) Double.NaN else sum / finite, finite, nan, inf, nonZero) }
     private fun argmaxHalf(buffer: ShortBuffer): Int { val c = buffer.duplicate(); var best = Float.NEGATIVE_INFINITY; var bestIndex = -1; var i = 0; while (c.hasRemaining()) { val v = halfToFloat(c.get().toInt() and 0xffff); if (v.isFinite() && v > best) { best = v; bestIndex = i }; i++ }; return bestIndex }
+    private fun halfAt(buffer: ShortBuffer, index: Int): Float { val c = buffer.duplicate(); c.position(index); return halfToFloat(c.get().toInt() and 0xffff) }
+    private fun topKHalf(buffer: ShortBuffer, k: Int): List<Pair<Int, Float>> {
+        val c = buffer.duplicate()
+        val values = ArrayList<Pair<Int, Float>>(c.remaining())
+        var index = 0
+        while (c.hasRemaining()) {
+            val value = halfToFloat(c.get().toInt() and 0xffff)
+            if (value.isFinite()) values += index to value
+            index++
+        }
+        return values.sortedByDescending { it.second }.take(k)
+    }
     private fun halfToFloat(bits: Int): Float { val sign = (bits ushr 15) and 1; val exp = (bits ushr 10) and 31; val frac = bits and 1023; val v = when (exp) { 0 -> frac / 1024.0f * Math.pow(2.0, -14.0).toFloat(); 31 -> if (frac == 0) Float.POSITIVE_INFINITY else Float.NaN; else -> (1f + frac / 1024f) * Math.pow(2.0, exp - 15.0).toFloat() }; return if (sign == 0) v else -v }
     private fun copyAsset(context: Context, asset: String): File { val f = File(context.cacheDir, asset.substringAfterLast('/')); context.assets.open(asset).use { input -> f.outputStream().use { output -> input.copyTo(output) } }; return f }
 }
