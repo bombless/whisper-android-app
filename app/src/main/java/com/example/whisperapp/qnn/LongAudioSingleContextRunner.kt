@@ -26,6 +26,7 @@ object LongAudioSingleContextRunner {
 
     data class Result(
         val chunks: List<ChunkResult>,
+        val finalTranscript: String,
         val passed: Boolean,
     )
 
@@ -41,11 +42,11 @@ object LongAudioSingleContextRunner {
         require(requestedSteps in 1..32) { "requestedSteps must be in 1..32" }
 
         val chunks = LongAudioChunker.split(pcm16, sampleRate)
-        Log.i(TAG, "LONG_AUDIO_START totalSamples=${pcm16.size} chunks=${chunks.size}")
+        LongAudioAppLogger.info("LONG_AUDIO_START totalSamples=${pcm16.size} chunks=${chunks.size}")
 
         val results = ArrayList<ChunkResult>(chunks.size)
         for (chunk in chunks) {
-            Log.i(TAG, "LONG_AUDIO_CHUNK_START index=${chunk.index} start=${chunk.startSample} end=${chunk.endSampleExclusive}")
+            LongAudioAppLogger.info("LONG_AUDIO_CHUNK_START index=${chunk.index} start=${chunk.startSample} end=${chunk.endSampleExclusive}")
 
             // The frozen Single-Context runner creates and releases its own inference state.
             val single = QnnWhisperRealAudioRunner.run(
@@ -59,15 +60,16 @@ object LongAudioSingleContextRunner {
                 "chunk=${chunk.index} Single-Context inference failed: ${single.report}"
             }
 
-            Log.i(TAG, "CHUNK_MEL_READY index=${chunk.index}")
-            Log.i(TAG, "CHUNK_ENCODER_READY index=${chunk.index}")
-            Log.i(TAG, "CHUNK_CROSS_READY index=${chunk.index}")
-            Log.i(TAG, "CHUNK_DECODER_START index=${chunk.index}")
+            LongAudioAppLogger.info("CHUNK_MEL_READY index=${chunk.index}")
+            LongAudioAppLogger.info("CHUNK_ENCODER_READY index=${chunk.index}")
+            LongAudioAppLogger.info("CHUNK_CROSS_READY index=${chunk.index}")
+            LongAudioAppLogger.info("DECODER_START index=${chunk.index}")
 
             val eosReached = single.tokenIds.lastOrNull() == EOS_TOKEN ||
                 single.report.contains("eos_reached: true")
-            if (eosReached) Log.i(TAG, "CHUNK_EOS index=${chunk.index} token=$EOS_TOKEN")
-            Log.i(TAG, "CHUNK_TOKENIZER_DONE index=${chunk.index}")
+            if (eosReached) LongAudioAppLogger.info("DECODER_EOS index=${chunk.index} step=${single.tokenIds.indexOf(EOS_TOKEN)} token=$EOS_TOKEN")
+            LongAudioAppLogger.info("TOKENIZER_INPUT_IDS index=${chunk.index} count=${single.tokenIds.size} ids=${single.tokenIds.contentToString()}")
+            LongAudioAppLogger.info("TOKENIZER_DECODED_TEXT index=${chunk.index} text=\"${single.text}\"")
 
             val result = ChunkResult(
                 chunkIndex = chunk.index,
@@ -80,10 +82,13 @@ object LongAudioSingleContextRunner {
                 eosReached = eosReached,
             )
             results += result
-            Log.i(TAG, "CHUNK_RESULT index=${result.chunkIndex} text=${result.decodedText} eos=${result.eosReached}")
+            LongAudioAppLogger.info("CHUNK_RESULT_TEXT index=${result.chunkIndex} text=\"${result.decodedText}\"")
         }
 
-        Log.i(TAG, "LONG_AUDIO_DONE chunks=${results.size}")
-        return Result(chunks = results, passed = true)
+        LongAudioAppLogger.info("LONG_AUDIO_MERGE_START chunks=${results.size}")
+        val finalTranscript = LongAudioSegmentMerger.merge(results)
+        LongAudioAppLogger.info("LONG_AUDIO_MERGE_DONE chunks=${results.size} text=$finalTranscript")
+        LongAudioAppLogger.info("LONG_AUDIO_DONE chunks=${results.size}")
+        return Result(chunks = results, finalTranscript = finalTranscript, passed = true)
     }
 }

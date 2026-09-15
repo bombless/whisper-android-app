@@ -7,6 +7,7 @@ plugins {
 android {
     namespace = "com.example.whisperapp"
     compileSdk = 35
+    ndkVersion = "25.2.9519653"
 
     packaging {
         jniLibs.useLegacyPackaging = true
@@ -18,6 +19,23 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "0.1"
+
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
+
+        externalNativeBuild {
+            cmake {
+                arguments += "-DANDROID_STL=c++_static"
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
     }
 
     buildTypes {
