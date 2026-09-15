@@ -10,6 +10,7 @@
         <activity android:name=".qnn.QnnSmokeActivity" android:exported="true" />
         <activity android:name=".qnn.M35RealAudioEncoderActivity" android:exported="true" />
         <activity android:name=".qnn.M35RealAudioDecoderActivity" android:exported="true" />
+        <activity android:name=".qnn.LongAudioVerificationActivity" android:exported="true" />
         <activity android:name=".MainActivity" android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
