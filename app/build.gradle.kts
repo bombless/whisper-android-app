@@ -44,4 +44,6 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.1")
     debugImplementation("androidx.compose.ui:ui-tooling")
+    testImplementation(kotlin("test"))
+    testImplementation("junit:junit:4.13.2")
 }
