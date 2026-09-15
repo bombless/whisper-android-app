@@ -22,6 +22,22 @@ class QnnSmokeActivity : Activity() {
             }.start()
             return
         }
+        if (intent.getBooleanExtra("whisper_step_smoke", false)) {
+            Thread {
+                val result = QnnWhisperStepRunner.run(this)
+                File(filesDir, "qnn-whisper-step-result.txt").writeText(result.report)
+                runOnUiThread { finish() }
+            }.start()
+            return
+        }
+        if (intent.getBooleanExtra("whisper_decoder_loop", false)) {
+            Thread {
+                val result = QnnWhisperDecoderLoopRunner.run(this)
+                File(filesDir, "qnn-whisper-loop-result.txt").writeText(result.report)
+                runOnUiThread { finish() }
+            }.start()
+            return
+        }
         if (intent.getBooleanExtra("decoder_smoke", false)) {
             Thread {
                 val result = QnnDecoderSmokeRunner.run(this)
