@@ -8,12 +8,15 @@
 #include <cstdint>
 #include <iomanip>
 #include <limits>
+#include <ctime>
+#include <filesystem>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <atomic>
 #include <chrono>
+#include <fstream>
 #include <vector>
 #include <android/log.h>
 
@@ -50,6 +53,75 @@ extern "C" int64_t whisper_get_encoder_build_time_us(const whisper_context * ctx
 extern "C" int64_t whisper_get_encoder_compute_time_us(const whisper_context * ctx);
 extern "C" const float * whisper_get_mel_data(const whisper_context * ctx, int64_t * elements, int * n_len, int * n_mel);
 extern "C" const float * whisper_get_encoder_input_data(const whisper_context * ctx, int64_t * elements);
+
+extern "C" const ggml_tensor * whisper_get_cross_k_cache(const whisper_context * ctx);
+extern "C" const ggml_tensor * whisper_get_cross_v_cache(const whisper_context * ctx);
+
+std::string dump_reference_cross_kv(const whisper_context * ctx, const std::string & dump_dir) {
+    constexpr int n_layer = 4;
+    constexpr int n_state = 384;
+    constexpr int n_head = 6;
+    constexpr int n_audio_ctx = 1500;
+    constexpr int head_dim = 64;
+    const ggml_tensor * cross_k = whisper_get_cross_k_cache(ctx);
+    const ggml_tensor * cross_v = whisper_get_cross_v_cache(ctx);
+    if (!cross_k || !cross_v) throw std::runtime_error("reference cross-K/V cache is unavailable");
+
+    if (cross_k->type != GGML_TYPE_F16 || cross_v->type != GGML_TYPE_F16) throw std::runtime_error("reference cross-K/V cache is not FP16");
+    const size_t logical_elements = static_cast<size_t>(n_state) * n_audio_ctx;
+    const size_t padded_elements_per_layer = ggml_nelements(cross_k) / n_layer;
+    const int padded_audio_ctx = static_cast<int>(padded_elements_per_layer / n_state);
+    if (padded_audio_ctx < n_audio_ctx) throw std::runtime_error("reference cross-K/V cache is smaller than logical audio context");
+    const size_t raw_layer_bytes = padded_elements_per_layer * ggml_element_size(cross_k);
+    std::vector<uint8_t> raw_k(raw_layer_bytes), raw_v(raw_layer_bytes);
+    std::filesystem::create_directories(dump_dir);
+    std::ostringstream report;
+    report << "REFERENCE_CROSS_KV_DUMP_START\\n"
+           << "layers=4 state=384 heads=6 headDim=64 audioCtx=1500\\n"
+           << "reference_K_logical_shape=[64,1500,6] axis=head_dim,sequence,head dtype=FP32\\n"
+           << "reference_V_logical_shape=[1500,64,6] axis=sequence,head_dim,head dtype=FP32\\n"
+           << "source_cache_layout=per_layer_flat; decoder_view_K=[64,1500,6]; decoder_view_V=[1500,64,6]\\n";
+
+    for (int il = 0; il < n_layer; ++il) {
+        const size_t layer_offset = static_cast<size_t>(il) * raw_layer_bytes;
+        ggml_backend_tensor_get(cross_k, raw_k.data(), layer_offset, raw_layer_bytes);
+        ggml_backend_tensor_get(cross_v, raw_v.data(), layer_offset, raw_layer_bytes);
+
+        const std::string k_path = dump_dir + "/reference_cross_k_" + std::to_string(il) + ".bin";
+        const std::string v_path = dump_dir + "/reference_cross_v_" + std::to_string(il) + ".bin";
+        const std::string k_meta = dump_dir + "/reference_cross_k_" + std::to_string(il) + ".metadata";
+        const std::string v_meta = dump_dir + "/reference_cross_v_" + std::to_string(il) + ".metadata";
+        std::ofstream kout(k_path, std::ios::binary), vout(v_path, std::ios::binary);
+        if (!kout || !vout) throw std::runtime_error("failed to create reference cross-K/V dump");
+
+        std::vector<float> k_canonical(logical_elements), v_canonical(logical_elements);
+        const ggml_fp16_t * k16 = reinterpret_cast<const ggml_fp16_t *>(raw_k.data());
+        const ggml_fp16_t * v16 = reinterpret_cast<const ggml_fp16_t *>(raw_v.data());
+        for (int h = 0; h < n_head; ++h) {
+            for (int s = 0; s < n_audio_ctx; ++s) {
+                for (int d = 0; d < head_dim; ++d) {
+                    const size_t k_raw_idx = static_cast<size_t>(s) * n_state + static_cast<size_t>(h) * head_dim + d;
+                    const size_t v_raw_idx = static_cast<size_t>(h) * n_audio_ctx * head_dim + static_cast<size_t>(d) * n_audio_ctx + s;
+                    const size_t k_idx = static_cast<size_t>(d) * n_audio_ctx * n_head + static_cast<size_t>(s) * n_head + h;
+                    const size_t v_idx = static_cast<size_t>(s) * head_dim * n_head + static_cast<size_t>(d) * n_head + h;
+                    k_canonical[k_idx] = ggml_fp16_to_fp32(k16[k_raw_idx]);
+                    v_canonical[v_idx] = ggml_fp16_to_fp32(v16[v_raw_idx]);
+                }
+            }
+        }
+        kout.write(reinterpret_cast<const char *>(k_canonical.data()), static_cast<std::streamsize>(k_canonical.size() * sizeof(float)));
+        vout.write(reinterpret_cast<const char *>(v_canonical.data()), static_cast<std::streamsize>(v_canonical.size() * sizeof(float)));
+        if (!kout || !vout) throw std::runtime_error("failed writing reference cross-K/V dump");
+
+        std::ofstream km(k_meta), vm(v_meta);
+        km << "layer=" << il << "\\ndtype=FP32\\nshape=[64,1500,6]\\nlogical_axis_order=head_dim,sequence,head\\nelements=" << logical_elements << "\\n";
+        vm << "layer=" << il << "\\ndtype=FP32\\nshape=[1500,64,6]\\nlogical_axis_order=sequence,head_dim,head\\nelements=" << logical_elements << "\\n";
+        if (!km || !vm) throw std::runtime_error("failed writing reference cross-K/V metadata");
+        report << "layer=" << il << " k=" << k_path << " v=" << v_path << " elements=" << logical_elements << "\\n";
+    }
+    report << "REFERENCE_CROSS_KV_DUMP_END\\n";
+    return report.str();
+}
 
 std::string inspect_float_checkpoint(const char * name, const float * data, size_t elements, int64_t ne0, int64_t ne1) {
     std::ostringstream report;
@@ -347,9 +419,21 @@ std::string run_encoder_diagnostic(const int16_t * samples, size_t sample_count,
         timing_report << "ENCODER_DONE rc=" << rc << " elapsed_ms=" << encoder_ms << "\\n";
         if (rc != 0) { DIAG_LOG("ENCODER_TEST_END result=FAILED"); whisper_free(ctx); return timing_report.str() + "ENCODER_TEST_END result=FAILED\\n"; }
         const std::string output_report = inspect_encoder_output(ctx);
+        const std::time_t now = std::time(nullptr);
+        std::tm tm_now{};
+#if defined(_WIN32)
+        localtime_s(&tm_now, &now);
+#else
+        localtime_r(&now, &tm_now);
+#endif
+        char stamp[32];
+        std::strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", &tm_now);
+        const std::string dump_dir = model_path + "_reference_cross_kv_" + stamp;
+        const std::string cross_report = dump_reference_cross_kv(ctx, dump_dir);
+        DIAG_LOG("REFERENCE_CROSS_KV_DUMP_DONE dir=%s", dump_dir.c_str());
         DIAG_LOG("ENCODER_TEST_END result=SUCCESS");
         whisper_free(ctx);
-        return checkpoint_report + timing_report.str() + output_report + "ENCODER_TEST_END result=SUCCESS\\n";
+        return checkpoint_report + timing_report.str() + output_report + cross_report + "ENCODER_TEST_END result=SUCCESS\\n";
     } catch (...) {
         whisper_free(ctx);
         DIAG_LOG("ENCODER_TEST_END result=FAILED");
