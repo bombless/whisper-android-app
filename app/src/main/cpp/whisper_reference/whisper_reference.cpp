@@ -46,6 +46,53 @@ std::vector<Pair> top_k(const float * logits, int vocab) {
 }
 
 extern "C" const ggml_tensor * whisper_get_encoder_output(const whisper_context * ctx);
+extern "C" int64_t whisper_get_encoder_build_time_us(const whisper_context * ctx);
+extern "C" int64_t whisper_get_encoder_compute_time_us(const whisper_context * ctx);
+extern "C" const float * whisper_get_mel_data(const whisper_context * ctx, int64_t * elements, int * n_len, int * n_mel);
+extern "C" const float * whisper_get_encoder_input_data(const whisper_context * ctx, int64_t * elements);
+
+std::string inspect_float_checkpoint(const char * name, const float * data, size_t elements, int64_t ne0, int64_t ne1) {
+    std::ostringstream report;
+    size_t finite = 0, nan = 0, inf = 0;
+    double min_value = std::numeric_limits<double>::infinity();
+    double max_value = -std::numeric_limits<double>::infinity();
+    double sum = 0.0, sum_sq = 0.0;
+    for (size_t i = 0; i < elements; ++i) {
+        const float value = data[i];
+        if (std::isnan(value)) ++nan;
+        else if (std::isinf(value)) ++inf;
+        else { ++finite; const double v = value; min_value = std::min(min_value, v); max_value = std::max(max_value, v); sum += v; sum_sq += v * v; }
+    }
+    const double mean = finite ? sum / static_cast<double>(finite) : std::numeric_limits<double>::quiet_NaN();
+    const double rms = finite ? std::sqrt(sum_sq / static_cast<double>(finite)) : std::numeric_limits<double>::quiet_NaN();
+    report << std::setprecision(9)
+           << name << "_SHAPE ne0=" << ne0 << " ne1=" << ne1 << " elements=" << elements << "\\n"
+           << name << "_MIN " << (finite ? min_value : std::numeric_limits<double>::quiet_NaN()) << "\\n"
+           << name << "_MAX " << (finite ? max_value : std::numeric_limits<double>::quiet_NaN()) << "\\n"
+           << name << "_MEAN " << mean << "\\n"
+           << name << "_RMS " << rms << "\\n"
+           << name << "_FINITE " << finite << "\\n"
+           << name << "_NAN " << nan << "\\n"
+           << name << "_INF " << inf << "\\n";
+    return report.str();
+}
+
+std::string inspect_input_checkpoints(const whisper_context * ctx) {
+    std::ostringstream report;
+    int64_t mel_elements = 0; int mel_len = 0, mel_count = 0;
+    const float * mel = whisper_get_mel_data(ctx, &mel_elements, &mel_len, &mel_count);
+    report << "CHECKPOINT_MEL_START\\n";
+    if (mel) report << inspect_float_checkpoint("CHECKPOINT_MEL", mel, static_cast<size_t>(mel_elements), mel_len, mel_count);
+    else report << "CHECKPOINT_MEL_UNAVAILABLE\\n";
+    report << "CHECKPOINT_MEL_END\\n";
+    int64_t input_elements = 0;
+    const float * input = whisper_get_encoder_input_data(ctx, &input_elements);
+    report << "CHECKPOINT_ENCODER_INPUT_START\\n";
+    if (input) report << inspect_float_checkpoint("CHECKPOINT_ENCODER_INPUT", input, static_cast<size_t>(input_elements), input_elements, 1);
+    else report << "CHECKPOINT_ENCODER_INPUT_UNAVAILABLE\\n";
+    report << "CHECKPOINT_ENCODER_INPUT_END\\n";
+    return report.str();
+}
 
 std::string inspect_encoder_output(const whisper_context * ctx) {
     const ggml_tensor * tensor = whisper_get_encoder_output(ctx);
@@ -245,6 +292,7 @@ std::string run_reference(const int16_t * samples, size_t sample_count, const st
     }
 }
 std::string run_encoder_diagnostic(const int16_t * samples, size_t sample_count, const std::string & model_path, int threads) {
+    DIAG_LOG("ENCODER_NATIVE_DIAGNOSTIC_ENTER samples=%zu threads=%d", sample_count, threads);
     if (sample_count != kReferenceSamples) throw std::runtime_error("diagnostic requires exactly 80000 PCM16 samples");
     if (threads < 1) threads = 1;
     using clock = std::chrono::steady_clock;
@@ -270,6 +318,7 @@ std::string run_encoder_diagnostic(const int16_t * samples, size_t sample_count,
         const auto mel_ms = std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - mel_start).count();
         if (mel_rc != 0) throw std::runtime_error("whisper_pcm_to_mel failed");
         DIAG_LOG("ENCODER_MEL_DONE elapsed_ms=%lld stage_ms=%lld", elapsed_ms(), static_cast<long long>(mel_ms));
+        const std::string checkpoint_report = inspect_input_checkpoints(ctx);
         DIAG_LOG("ENCODER_START");
         std::atomic<bool> encoder_running{true};
         std::thread watchdog([&]() {
@@ -284,12 +333,23 @@ std::string run_encoder_diagnostic(const int16_t * samples, size_t sample_count,
         encoder_running.store(false, std::memory_order_relaxed);
         watchdog.join();
         const auto encoder_ms = std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - encoder_start).count();
+        const int64_t build_us = whisper_get_encoder_build_time_us(ctx);
+        const int64_t compute_us = whisper_get_encoder_compute_time_us(ctx);
+        const double build_ms = static_cast<double>(build_us) / 1000.0;
+        const double compute_ms = static_cast<double>(compute_us) / 1000.0;
+        DIAG_LOG("ENCODER_BUILD_DONE elapsed_ms=%.3f", build_ms);
+        DIAG_LOG("ENCODER_COMPUTE_DONE elapsed_ms=%.3f", compute_ms);
         DIAG_LOG("ENCODER_DONE rc=%d elapsed_ms=%lld", rc, static_cast<long long>(encoder_ms));
-        if (rc != 0) { DIAG_LOG("ENCODER_TEST_END result=FAILED"); whisper_free(ctx); return "ENCODER_TEST_END result=FAILED\\n"; }
+        std::ostringstream timing_report;
+        timing_report << std::fixed << std::setprecision(3);
+        timing_report << "ENCODER_BUILD_DONE elapsed_ms=" << build_ms << "\\n";
+        timing_report << "ENCODER_COMPUTE_DONE elapsed_ms=" << compute_ms << "\\n";
+        timing_report << "ENCODER_DONE rc=" << rc << " elapsed_ms=" << encoder_ms << "\\n";
+        if (rc != 0) { DIAG_LOG("ENCODER_TEST_END result=FAILED"); whisper_free(ctx); return timing_report.str() + "ENCODER_TEST_END result=FAILED\\n"; }
         const std::string output_report = inspect_encoder_output(ctx);
         DIAG_LOG("ENCODER_TEST_END result=SUCCESS");
         whisper_free(ctx);
-        return output_report + "ENCODER_TEST_END result=SUCCESS\\n";
+        return checkpoint_report + timing_report.str() + output_report + "ENCODER_TEST_END result=SUCCESS\\n";
     } catch (...) {
         whisper_free(ctx);
         DIAG_LOG("ENCODER_TEST_END result=FAILED");
@@ -333,8 +393,7 @@ Java_com_example_whisperapp_qnn_WhisperReferenceRunner_runNative(
 }
 
 extern "C" JNIEXPORT jstring JNICALL
-Java_com_example_whisperapp_qnn_WhisperEncoderDiagnosticRunner_runNative(
-        JNIEnv * env, jobject, jshortArray pcm, jstring model_path, jint threads) {
+Java_com_example_whisperapp_qnn_WhisperReferenceRunner_transcribeNative(JNIEnv * env, jobject, jshortArray pcm, jstring model_path, jint threads) {
     try {
         if (!pcm || !model_path) throw std::runtime_error("pcm/model_path is null");
         const jsize count = env->GetArrayLength(pcm);
@@ -342,14 +401,51 @@ Java_com_example_whisperapp_qnn_WhisperEncoderDiagnosticRunner_runNative(
         const jshort * data = env->GetShortArrayElements(pcm, nullptr);
         if (!data) throw std::runtime_error("GetShortArrayElements failed");
         const char * path = env->GetStringUTFChars(model_path, nullptr);
+        if (!path) throw std::runtime_error("GetStringUTFChars failed");
+        std::vector<float> samples(kReferenceSamples);
+        for (int i = 0; i < kReferenceSamples; ++i) samples[i] = static_cast<float>(data[i]) / 32768.0f;
+        whisper_context_params ctx_params = whisper_context_default_params(); ctx_params.use_gpu = false;
+        whisper_context * ctx = whisper_init_from_file_with_params(path, ctx_params);
+        if (!ctx) throw std::runtime_error("whisper_init_from_file failed");
+        whisper_full_params params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+        params.print_progress = false; params.print_special = false; params.print_realtime = false; params.print_timestamps = false;
+        params.translate = false; params.no_context = true; params.language = "en"; params.n_threads = std::max(1, static_cast<int>(threads));
+        if (whisper_full(ctx, params, samples.data(), static_cast<int>(samples.size())) != 0) throw std::runtime_error("whisper_full failed");
+        std::ostringstream out; out << "WHISPER_TRANSCRIBE_TEXT ";
+        const int n_segments = whisper_full_n_segments(ctx);
+        for (int i = 0; i < n_segments; ++i) { const char * text = whisper_full_get_segment_text(ctx, i); if (text) out << text; }
+        out << "\nWHISPER_TRANSCRIBE_DONE segments=" << n_segments << "\n";
+        whisper_free(ctx); env->ReleaseStringUTFChars(model_path, path); env->ReleaseShortArrayElements(pcm, const_cast<jshort *>(data), JNI_ABORT);
+        return env->NewStringUTF(out.str().c_str());
+    } catch (const std::exception & e) { return env->NewStringUTF((std::string("WHISPER_TRANSCRIBE_FAIL ") + e.what()).c_str()); }
+}
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_example_whisperapp_qnn_WhisperEncoderDiagnosticRunner_runNative(
+        JNIEnv * env, jobject, jshortArray pcm, jstring model_path, jint threads) {
+    DIAG_LOG("ENCODER_JNI_START threads=%d", threads);
+    try {
+        if (!pcm || !model_path) throw std::runtime_error("pcm/model_path is null");
+        const jsize count = env->GetArrayLength(pcm);
+        DIAG_LOG("ENCODER_JNI_PCM count=%d", static_cast<int>(count));
+        if (count != kReferenceSamples) throw std::runtime_error("PCM length must be 80000");
+        const jshort * data = env->GetShortArrayElements(pcm, nullptr);
+        if (!data) throw std::runtime_error("GetShortArrayElements failed");
+        DIAG_LOG("ENCODER_JNI_PCM_ACQUIRE_DONE");
+        const char * path = env->GetStringUTFChars(model_path, nullptr);
         if (!path) { env->ReleaseShortArrayElements(pcm, const_cast<jshort *>(data), JNI_ABORT); throw std::runtime_error("GetStringUTFChars failed"); }
+        DIAG_LOG("ENCODER_JNI_MODEL_PATH_READY");
         std::string result;
-        try { result = run_encoder_diagnostic(reinterpret_cast<const int16_t *>(data), static_cast<size_t>(count), path, threads); }
+        try {
+            DIAG_LOG("ENCODER_JNI_NATIVE_CALL_START");
+            result = run_encoder_diagnostic(reinterpret_cast<const int16_t *>(data), static_cast<size_t>(count), path, threads);
+            DIAG_LOG("ENCODER_JNI_NATIVE_CALL_DONE reportChars=%zu", result.size());
+        }
         catch (...) { env->ReleaseStringUTFChars(model_path, path); env->ReleaseShortArrayElements(pcm, const_cast<jshort *>(data), JNI_ABORT); throw; }
         env->ReleaseStringUTFChars(model_path, path);
         env->ReleaseShortArrayElements(pcm, const_cast<jshort *>(data), JNI_ABORT);
         return env->NewStringUTF(result.c_str());
     } catch (const std::exception & e) {
+        DIAG_LOG("ENCODER_JNI_EXCEPTION");
         DIAG_LOG("ENCODER_TEST_ERROR type=exception message=%s", e.what());
         return env->NewStringUTF((std::string("ENCODER_TEST_END result=FAILED error=") + e.what() + "\n").c_str());
     }

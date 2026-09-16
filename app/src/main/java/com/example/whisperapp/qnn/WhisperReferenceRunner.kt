@@ -46,5 +46,18 @@ object WhisperReferenceRunner {
         return digest.digest(bytes).joinToString("") { "%02x".format(it) }
     }
 
+    fun transcribeFirst5s(context: Context, pcm16: ShortArray, sampleRate: Int, threads: Int = 1): String {
+        require(sampleRate == SAMPLE_RATE) { "Reference expects 16000 Hz, got $sampleRate" }
+        require(pcm16.size == SAMPLE_COUNT) { "Reference expects exactly 80000 samples, got ${pcm16.size}" }
+        val model = File(context.cacheDir, "whisper_reference/ggml-tiny.bin")
+        if (!model.isFile || model.length() < 70_000_000L) {
+            model.parentFile?.mkdirs()
+            context.assets.open(MODEL_ASSET).use { input -> model.outputStream().use { output -> input.copyTo(output) } }
+        }
+        return transcribeNative(pcm16, model.absolutePath, threads)
+    }
+
     private external fun runNative(pcm: ShortArray, modelPath: String, threads: Int): String
+
+    private external fun transcribeNative(pcm: ShortArray, modelPath: String, threads: Int): String
 }
