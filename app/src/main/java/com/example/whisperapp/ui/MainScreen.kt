@@ -1,100 +1,197 @@
 package com.example.whisperapp.ui
 
-import android.content.Intent
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.Button
-import androidx.compose.material3.Card
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Text
+import android.Manifest
+import android.content.pm.PackageManager
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
+import android.util.Log
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import com.example.whisperapp.audio.WavPcmReader
-import com.example.whisperapp.qnn.WhisperReferenceRunner
+import androidx.core.content.ContextCompat
+import com.example.whisperapp.audio.AudioPlayer
+import com.example.whisperapp.qnn.QnnWhisperRealAudioRunner
+import com.example.whisperapp.tts.ChineseTextProcessor
+import com.example.whisperapp.tts.VoiceAiTtsEngine
+import com.example.whisperapp.tts.TtsQueue
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 
 @Composable
 fun MainScreen() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    var text by remember { mutableStateOf("") }
     var recording by remember { mutableStateOf(false) }
-    var transcribing by remember { mutableStateOf(false) }
+    var processing by remember { mutableStateOf(false) }
+    var status by remember { mutableStateOf("点击开始，说话即可实时转录") }
+    var ttsEnabled by remember { mutableStateOf(true) }
+    val transcript = remember { mutableStateListOf<String>() }
+    var recordingJob by remember { mutableStateOf<Job?>(null) }
+    var previousWhisperText by remember { mutableStateOf("") }
+    val audioPlayer = remember { AudioPlayer() }
+    val ttsEngine = remember { VoiceAiTtsEngine(context) }
+    val ttsQueue = remember {
+        TtsQueue(scope, ttsEngine, audioPlayer) { error ->
+            scope.launch(Dispatchers.Main) {
+                if (recording) status = "朗读失败，继续监听…"
+            }
+        }
+    }
 
-    Column(
-        modifier = Modifier.fillMaxSize().padding(24.dp),
-        verticalArrangement = Arrangement.Top
-    ) {
-        Text("Snapdragon Voice Lab", style = MaterialTheme.typography.headlineSmall)
-        Spacer(Modifier.height(8.dp))
-        Text("Backend: HTP / QNN")
-        Text("ASR: Whisper-Tiny")
-        Text("TTS: MeloTTS-ZH")
-        Spacer(Modifier.height(20.dp))
-        Button(
-            onClick = { context.startActivity(Intent(context, com.example.whisperapp.qnn.LongAudioVerificationActivity::class.java)) },
-            modifier = Modifier.fillMaxWidth()
-        ) { Text("Run Long Audio Verification") }
-        Spacer(Modifier.height(8.dp))
-        Button(
-            onClick = { context.startActivity(Intent(context, com.example.whisperapp.qnn.WhisperReferenceActivity::class.java)) },
-            modifier = Modifier.fillMaxWidth()
-        ) { Text("Run Whisper 5-Step Comparison") }
-        Spacer(Modifier.height(8.dp))
-        Button(
-            onClick = {
-                transcribing = true
-                scope.launch(Dispatchers.IO) {
-                    val result = runCatching {
-                        val wav = java.io.File(context.getExternalFilesDir(null), "long_audio_input.wav")
-                        require(wav.isFile) { "Missing ${wav.absolutePath}" }
-                        val pcm = wav.inputStream().use { WavPcmReader.read(it) }
-                        require(pcm.sampleRate == 16_000) { "Expected 16000 Hz, got ${pcm.sampleRate}" }
-                        require(pcm.samples.size >= 80_000) { "Need at least 80000 samples, got ${pcm.samples.size}" }
-                        WhisperReferenceRunner.transcribeFirst5s(context, pcm.samples.copyOf(80_000), 16_000, threads = 1)
-                    }.getOrElse { "WHISPER_TRANSCRIBE_FAIL ${it.message ?: it::class.java.simpleName}" }
-                    withContext(Dispatchers.Main) {
-                        text = result.substringAfter("WHISPER_TRANSCRIBE_TEXT ", result).substringBefore("\nWHISPER_TRANSCRIBE_DONE")
-                        transcribing = false
+    fun stop() {
+        Log.i("WHISPER_DIAG", "RECORD_STOP recordingJob=${recordingJob != null}")
+        recording = false
+        recordingJob?.cancel()
+        recordingJob = null
+        processing = false
+        previousWhisperText = ""
+        ttsQueue.clearAndStop()
+        status = "已停止"
+    }
+
+    fun start() {
+        Log.i("WHISPER_DIAG", "RECORD_START")
+        transcript.clear()
+        previousWhisperText = ""
+        ttsQueue.clearAndStop()
+        recording = true
+        status = "正在监听…"
+        recordingJob = scope.launch(Dispatchers.IO) {
+            val rate = 16_000
+            val samplesPerChunk = rate * 5
+            val minBuffer = AudioRecord.getMinBufferSize(rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+            if (minBuffer <= 0) {
+                withContext(Dispatchers.Main) { recording = false; status = "麦克风不可用" }
+                return@launch
+            }
+            val recorder = AudioRecord(MediaRecorder.AudioSource.MIC, rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, maxOf(minBuffer, samplesPerChunk))
+            val chunk = ShortArray(samplesPerChunk)
+            var offset = 0
+            try {
+                recorder.startRecording()
+                Log.i("WHISPER_DIAG", "AUDIO_RECORD_STARTED state=${recorder.recordingState} minBuffer=$minBuffer chunkSamples=$samplesPerChunk")
+                while (kotlinx.coroutines.currentCoroutineContext().isActive) {
+                    val n = recorder.read(chunk, offset, samplesPerChunk - offset)
+                    if (n <= 0) {
+                        Log.w("WHISPER_DIAG", "AUDIO_READ_ERROR n=$n offset=$offset state=${recorder.recordingState}")
+                        continue
+                    }
+                    offset += n
+                    if (offset == samplesPerChunk) {
+                        offset = 0
+                        Log.i("WHISPER_DIAG", "CHUNK_READY samples=$samplesPerChunk rms=${kotlin.math.sqrt(chunk.map { it.toDouble() * it }.average())}")
+                        withContext(Dispatchers.Main) { processing = true; status = "正在转录…" }
+                        Log.i("WHISPER_DIAG", "TRANSCRIBE_START samples=${chunk.size} rate=$rate threads=2")
+                        val text = runCatching {
+                            QnnWhisperRealAudioRunner.run(context, chunk.copyOf(), rate, requestedSteps = 12, autoregressive = true).also { result -> check(result.passed) { result.report } }.text.trim()
+                        }.onSuccess {
+                            Log.i("WHISPER_DIAG", "NATIVE_RESULT chars=${it.length} text=${it.take(160)}")
+                        }.onFailure {
+                            Log.e("WHISPER_DIAG", "NATIVE_ERROR type=${it::class.java.name} message=${it.message}", it)
+                        }.getOrElse { "转录失败：${it.message ?: it::class.java.simpleName}" }
+                        withContext(Dispatchers.Main) {
+                            val normalized = ChineseTextProcessor.normalizeChineseText(text)
+                            Log.i("WHISPER_DIAG", "UI_UPDATE rawChars=${text.length} normalizedChars=${normalized.length} blank=${normalized.isBlank()}")
+                            if (normalized.isNotBlank()) {
+                                transcript.add(normalized)
+                                if (ttsEnabled) {
+                                    val newText = ChineseTextProcessor.incrementalNewText(previousWhisperText, normalized)
+                                    ChineseTextProcessor.splitSentences(newText).forEach(ttsQueue::offer)
+                                }
+                                previousWhisperText = normalized
+                            }
+                            processing = false
+                            status = if (recording) "正在监听…" else "已停止"
+                        }
                     }
                 }
-            },
-            enabled = !transcribing,
-            modifier = Modifier.fillMaxWidth()
-        ) { Text(if (transcribing) "Transcribing first 5 seconds..." else "Transcribe First 5 Seconds (whisper.cpp)") }
-        Spacer(Modifier.height(12.dp))
-        Button(onClick = { recording = !recording }, modifier = Modifier.fillMaxWidth()) {
-            Text(if (recording) "Stop Recording" else "Start Recording")
+            } finally {
+                runCatching { recorder.stop() }
+                recorder.release()
+            }
         }
-        Spacer(Modifier.height(16.dp))
-        Text("Recognized Text")
-        OutlinedTextField(
-            value = text,
-            onValueChange = { text = it },
-            modifier = Modifier.fillMaxWidth().height(140.dp),
-            placeholder = { Text("ASR output will appear here") }
-        )
-        Spacer(Modifier.height(12.dp))
-        Button(onClick = { }, modifier = Modifier.fillMaxWidth()) { Text("Speak") }
-        Spacer(Modifier.height(16.dp))
-        Card(Modifier.fillMaxWidth()) {
-            Column(Modifier.padding(16.dp)) {
-                Text("Inference: ?")
-                Text("Audio: ?")
-                Text("RTF: ?")
-                Text("Backend: HTP (pending smoke test)")
-                Text("Offline: YES")
+    }
+
+    val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) start() else status = "需要麦克风权限才能转录"
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            recordingJob?.cancel()
+            ttsQueue.close()
+            audioPlayer.release()
+        }
+    }
+
+    Surface(Modifier.fillMaxSize()) {
+        Column(Modifier.fillMaxSize().padding(20.dp), verticalArrangement = Arrangement.SpaceBetween) {
+            Column(Modifier.fillMaxWidth()) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(Modifier.size(12.dp).background(if (recording) Color(0xFF42A85F) else MaterialTheme.colorScheme.outline, CircleShape))
+                    Spacer(Modifier.width(10.dp))
+                    Text("实时转录", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.SemiBold)
+                }
+                Spacer(Modifier.height(8.dp))
+                Text(status, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Spacer(Modifier.height(24.dp))
+                Surface(Modifier.fillMaxWidth().height(420.dp), shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.surfaceVariant) {
+                    if (transcript.isEmpty()) {
+                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("你的语音会出现在这里", color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                    } else {
+                        LazyColumn(Modifier.fillMaxSize().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                            items(transcript) { line -> Text(line, style = MaterialTheme.typography.bodyLarge) }
+                        }
+                    }
+                }
+            }
+            Column(Modifier.fillMaxWidth()) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Text("中文朗读", style = MaterialTheme.typography.bodyLarge)
+                    Switch(checked = ttsEnabled, onCheckedChange = { enabled ->
+                        ttsEnabled = enabled
+                        if (!enabled) ttsQueue.clearAndStop()
+                    })
+                }
+                Spacer(Modifier.height(8.dp))
+                Button(
+                    onClick = {
+                        if (recording) stop()
+                        else if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) start()
+                        else permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                    },
+                    enabled = true,
+                    modifier = Modifier.fillMaxWidth().height(56.dp),
+                    shape = RoundedCornerShape(18.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = if (recording) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary)
+                ) { Text(if (recording) "停止转录" else "开始说话") }
+                Spacer(Modifier.height(8.dp))
+                Text("Whisper Tiny · 16 kHz · 每 5 秒更新一次", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelMedium)
             }
         }
     }
 }
+
+
+
