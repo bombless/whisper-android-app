@@ -38,7 +38,7 @@ object QnnWhisperRealAudioRunner {
     private data class HalfStats(val min: Float, val max: Float, val mean: Double, val finite: Int, val nan: Int, val inf: Int, val nonZero: Int)
 
     fun run(context: Context, pcm16: ShortArray, sampleRate: Int, requestedSteps: Int = MAX_STEPS, autoregressive: Boolean = false): Result {
-        require(if (autoregressive) requestedSteps in 1..(forcedPrompt.size + MAX_GENERATION_STEPS) else requestedSteps in 1..MAX_STEPS)
+        require(if (autoregressive) requestedSteps in 1..(forcedPrompt.size - 1 + MAX_GENERATION_STEPS) else requestedSteps in 1..MAX_STEPS)
         require(sampleRate == WhisperFeatureExtractor.SAMPLE_RATE) { "Whisper expects 16000 Hz, got $sampleRate" }
         return try {
             Log.i(TAG, "START requestedSteps=$requestedSteps samples=${pcm16.size} sampleRate=$sampleRate")
@@ -154,7 +154,6 @@ object QnnWhisperRealAudioRunner {
 
             var selfKv = LinkedHashMap<String, OnnxTensor>()
             for (name in selfInNames) selfKv[name] = f16(env, selfShape(name), tensors)
-            val attentionMask = f16(env, longArrayOf(1, 1, 1, 200), tensors)
             val forcedValidationMode = !autoregressive
             var currentToken = forcedPrompt.last()
             var completedSteps = 0
@@ -168,6 +167,7 @@ object QnnWhisperRealAudioRunner {
                 val inputToken = if (forcedValidationMode) forcedPrompt[step % forcedPrompt.size] else if (step < forcedPrompt.size) forcedPrompt[step] else currentToken
                 val stepStart = System.nanoTime()
                 val stepTensors = mutableListOf<OnnxTensor>()
+                val attentionMask = causalAttentionMask(env, step, stepTensors)
                 val stepResult = runDecoderStep(
                     env = env,
                     session = decoderSession,
@@ -202,10 +202,8 @@ object QnnWhisperRealAudioRunner {
 
                 selfKv = stepResult.nextSelfKv
                 completedSteps++
-                if (!forcedValidationMode && step == forcedPrompt.size - 1) {
-                    currentToken = nextToken
-                }
-                if (!forcedValidationMode && step >= forcedPrompt.size) {
+                // The last prompt input already predicts the first generated token.
+                if (!forcedValidationMode && step >= forcedPrompt.size - 1) {
                     generationStepsCompleted++
                     if (nextToken == EOS_TOKEN) {
                         generated += nextToken
@@ -255,7 +253,8 @@ object QnnWhisperRealAudioRunner {
                 appendLine("decoder_step_0: PASS")
                 appendLine("steps_requested: $requestedSteps")
                 appendLine("steps_completed: $completedSteps")
-                appendLine("generation_steps_requested: ${if (autoregressive) requestedSteps - forcedPrompt.size else 0}")
+                appendLine("generation_steps_requested: ${if (autoregressive) (requestedSteps - forcedPrompt.size + 1).coerceAtLeast(0) else 0}")
+                appendLine("attention_mask: right-aligned valid KV, FP16 masked_value=-100")
                 appendLine("autoregressive: $autoregressive")
                 appendLine("generation_steps_completed: $generationStepsCompleted")
                 appendLine("cross_kv_computed_once: true")
@@ -347,6 +346,21 @@ object QnnWhisperRealAudioRunner {
     }
 
     private fun selfShape(name: String) = if (name.startsWith("k_")) longArrayOf(6, 1, 64, 199) else longArrayOf(6, 1, 199, 64)
+
+    /**
+     * The graph appends the current token after 199 cache slots, then returns the
+     * last 199 slots. Valid keys are on the right; unused leading slots are masked.
+     */
+    private fun causalAttentionMask(env: OrtEnvironment, position: Int, owner: MutableList<OnnxTensor>): OnnxTensor {
+        val values = WhisperDecoderMask.forPosition(position)
+        return OnnxTensor.createTensor(
+            env,
+            ShortBuffer.wrap(values),
+            longArrayOf(1, 1, 1, 200),
+            OnnxJavaType.FLOAT16
+        ).also { owner += it }
+    }
+
     private fun i32(env: OrtEnvironment, shape: LongArray, value: Int, owner: MutableList<OnnxTensor>) = OnnxTensor.createTensor(env, IntBuffer.wrap(IntArray(shape.fold(1L) { a, b -> a * b }.toInt()) { value }), shape).also { owner += it }
     private fun f16(env: OrtEnvironment, shape: LongArray, owner: MutableList<OnnxTensor>) = OnnxTensor.createTensor(env, ShortBuffer.wrap(ShortArray(shape.fold(1L) { a, b -> a * b }.toInt())), shape, OnnxJavaType.FLOAT16).also { owner += it }
     private fun f16FromFloat(env: OrtEnvironment, values: FloatArray, shape: LongArray, owner: MutableList<OnnxTensor>) =

@@ -95,7 +95,6 @@ object QnnWhisperDecoderLoopRunner {
 
             var selfKv = LinkedHashMap<String, OnnxTensor>()
             for (name in selfInNames) selfKv[name] = f16(env, selfShape(name), tensors)
-            val attentionMask = f16(env, longArrayOf(1, 1, 1, 200), tensors)
             var currentToken = VALIDATED_BOS_TOKEN
             var position = 0
             var completedSteps = 0
@@ -104,6 +103,7 @@ object QnnWhisperDecoderLoopRunner {
             repeat(requestedSteps) { step ->
                 val stepStart = System.nanoTime()
                 val stepTensors = mutableListOf<OnnxTensor>()
+                val attentionMask = causalAttentionMask(env, position, stepTensors)
                 val stepResult = runDecoderStep(
                     env = env,
                     session = decoderSession,
@@ -164,7 +164,7 @@ object QnnWhisperDecoderLoopRunner {
                 appendLine("encoder_ms: $encoderMs")
                 appendLine("encoder_context_binary_bytes: ${encoderBinary.length()}")
                 appendLine("decoder_context_binary_bytes: ${decoderBinary.length()}")
-                appendLine("attention_mask: [1,1,1,200] FP16 reused")
+                appendLine("attention_mask: causal [1,1,1,200] FP16 per step")
                 appendLine("position_ids: 0..${completedSteps - 1}")
                 appendLine("BOS: validated existing runner value $VALIDATED_BOS_TOKEN")
                 appendLine("EOS detection: unavailable / not configured")
@@ -242,6 +242,11 @@ object QnnWhisperDecoderLoopRunner {
     }
 
     private fun selfShape(name: String) = if (name.startsWith("k_")) longArrayOf(6, 1, 64, 199) else longArrayOf(6, 1, 199, 64)
+    private fun causalAttentionMask(env: OrtEnvironment, position: Int, owner: MutableList<OnnxTensor>): OnnxTensor {
+        val values = WhisperDecoderMask.forPosition(position)
+        return OnnxTensor.createTensor(env, ShortBuffer.wrap(values), longArrayOf(1, 1, 1, 200), OnnxJavaType.FLOAT16).also { owner += it }
+    }
+
     private fun i32(env: OrtEnvironment, shape: LongArray, value: Int, owner: MutableList<OnnxTensor>) = OnnxTensor.createTensor(env, IntBuffer.wrap(IntArray(shape.fold(1L) { a, b -> a * b }.toInt()) { value }), shape).also { owner += it }
     private fun f16(env: OrtEnvironment, shape: LongArray, owner: MutableList<OnnxTensor>) = OnnxTensor.createTensor(env, ShortBuffer.wrap(ShortArray(shape.fold(1L) { a, b -> a * b }.toInt())), shape, OnnxJavaType.FLOAT16).also { owner += it }
     private fun copyHalfTensor(env: OrtEnvironment, source: OnnxTensor, shape: LongArray, owner: MutableList<OnnxTensor>): OnnxTensor { val src = source.getShortBuffer().duplicate(); val copy = ShortArray(src.remaining()); src.get(copy); return OnnxTensor.createTensor(env, ShortBuffer.wrap(copy), shape, OnnxJavaType.FLOAT16).also { owner += it } }
