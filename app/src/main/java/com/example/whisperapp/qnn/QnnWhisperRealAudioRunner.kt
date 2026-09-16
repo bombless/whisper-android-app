@@ -32,16 +32,113 @@ object QnnWhisperRealAudioRunner {
     private val crossNames = (0 until 4).flatMap { listOf("k_cache_cross_$it", "v_cache_cross_$it") }
     private val selfInNames = (0 until 4).flatMap { listOf("k_cache_self_${it}_in", "v_cache_self_${it}_in") }
     private val selfOutNames = (0 until 4).flatMap { listOf("k_cache_self_${it}_out", "v_cache_self_${it}_out") }
+    private val lifecycleLock = Any()
+    private var env: OrtEnvironment? = null
+    private var encoderSession: OrtSession? = null
+    private var decoderSession: OrtSession? = null
+    private var encoderOptions: OrtSession.SessionOptions? = null
+    private var decoderOptions: OrtSession.SessionOptions? = null
+    private var qnnRegistered = false
+    private var lifecycleChunk = 0
 
     data class Result(val passed: Boolean, val report: String, val tokenIds: IntArray = IntArray(0), val text: String = "")
     private data class DecoderStepResult(val logits: OnnxTensor, val nextSelfKv: LinkedHashMap<String, OnnxTensor>)
     private data class HalfStats(val min: Float, val max: Float, val mean: Double, val finite: Int, val nan: Int, val inf: Int, val nonZero: Int)
+
+    fun start(context: Context) {
+        synchronized(lifecycleLock) {
+            if (env != null && encoderSession != null && decoderSession != null) return
+            Log.i(TAG, "QNN_LIFECYCLE START")
+            val appContext = context.applicationContext
+            val encoderModel = copyAsset(appContext, "models/whisper/encoder_ctx.onnx")
+            val decoderModel = copyAsset(appContext, "models/whisper/decoder_ctx.onnx")
+            env = OrtEnvironment.getEnvironment(OrtLoggingLevel.ORT_LOGGING_LEVEL_INFO, TAG)
+            val runtimeEnv = env!!
+            Log.i(TAG, "QNN_LIFECYCLE INIT_ORT")
+            System.loadLibrary("onnxruntime_providers_qnn")
+            runtimeEnv.registerExecutionProviderLibrary(EP_NAME, "libonnxruntime_providers_qnn.so")
+            qnnRegistered = true
+            Log.i(TAG, "QNN_LIFECYCLE REGISTER_EP")
+            val device = runtimeEnv.epDevices.firstOrNull { it.epName == EP_NAME } ?: error("QNN EP device not exposed")
+            val backend = File(appContext.applicationInfo.nativeLibraryDir, "libQnnHtp.so")
+            check(backend.isFile) { "HTP backend missing: ${backend.absolutePath}" }
+            val epOptions = mapOf("backend_path" to backend.absolutePath, "soc_model" to "57", "htp_arch" to "75", "offload_graph_io_quantization" to "0")
+            fun makeOptions() = OrtSession.SessionOptions().apply {
+                addConfigEntry("session.disable_cpu_ep_fallback", "1")
+                setSessionLogLevel(OrtLoggingLevel.ORT_LOGGING_LEVEL_INFO)
+                addExecutionProvider(listOf(device), epOptions)
+            }
+            encoderOptions = makeOptions()
+            decoderOptions = makeOptions()
+            Log.i(TAG, "QNN_LIFECYCLE CREATE_ENCODER")
+            encoderSession = runtimeEnv.createSession(encoderModel.absolutePath, encoderOptions)
+            Log.i(TAG, "QNN_LIFECYCLE CREATE_DECODER")
+            decoderSession = runtimeEnv.createSession(decoderModel.absolutePath, decoderOptions)
+            check(encoderSession!!.inputNames == setOf("input_features")) { "encoder inputs=${encoderSession!!.inputNames}" }
+            check(encoderSession!!.outputNames.toSet() == crossNames.toSet()) { "encoder outputs=${encoderSession!!.outputNames}" }
+            check(decoderSession!!.inputNames.size == 19) { "decoder inputs=${decoderSession!!.inputNames}" }
+            check(decoderSession!!.outputNames.toSet() == (selfOutNames + "logits").toSet()) { "decoder outputs=${decoderSession!!.outputNames}" }
+            validateDecoderContract(decoderSession!!)
+            lifecycleChunk = 0
+        }
+    }
+
+    fun transcribeChunk(context: Context, pcm16: ShortArray, sampleRate: Int, requestedSteps: Int = MAX_STEPS, autoregressive: Boolean = false): Result {
+        synchronized(lifecycleLock) {
+            start(context)
+            lifecycleChunk++
+            Log.i(TAG, "QNN_CHUNK START #$lifecycleChunk")
+            return try {
+                transcribeChunkLocked(context.applicationContext, pcm16, sampleRate, requestedSteps, autoregressive)
+            } finally {
+                Log.i(TAG, "QNN_CHUNK DONE #$lifecycleChunk")
+            }
+        }
+    }
+
+    fun stop() {
+        synchronized(lifecycleLock) {
+            if (env == null && encoderSession == null && decoderSession == null && !qnnRegistered) return
+            Log.i(TAG, "QNN_LIFECYCLE STOP")
+            try { decoderSession?.close() } catch (_: Throwable) {}
+            Log.i(TAG, "QNN_LIFECYCLE CLOSE_DECODER")
+            try { encoderSession?.close() } catch (_: Throwable) {}
+            Log.i(TAG, "QNN_LIFECYCLE CLOSE_ENCODER")
+            try { decoderOptions?.close() } catch (_: Throwable) {}
+            try { encoderOptions?.close() } catch (_: Throwable) {}
+            if (qnnRegistered) {
+                try { env?.unregisterExecutionProviderLibrary(EP_NAME) } catch (_: Throwable) {}
+                Log.i(TAG, "QNN_LIFECYCLE UNREGISTER_EP")
+            }
+            try { env?.close() } catch (_: Throwable) {}
+            Log.i(TAG, "QNN_LIFECYCLE CLOSE_ENV")
+            decoderSession = null
+            encoderSession = null
+            decoderOptions = null
+            encoderOptions = null
+            env = null
+            qnnRegistered = false
+            lifecycleChunk = 0
+        }
+    }
 
     fun run(context: Context, pcm16: ShortArray, sampleRate: Int, requestedSteps: Int = MAX_STEPS, autoregressive: Boolean = false): Result {
         require(if (autoregressive) requestedSteps in 1..(forcedPrompt.size - 1 + MAX_GENERATION_STEPS) else requestedSteps in 1..MAX_STEPS)
         require(sampleRate == WhisperFeatureExtractor.SAMPLE_RATE) { "Whisper expects 16000 Hz, got $sampleRate" }
         return try {
             Log.i(TAG, "START requestedSteps=$requestedSteps samples=${pcm16.size} sampleRate=$sampleRate")
+            start(context)
+            transcribeChunk(context, pcm16, sampleRate, requestedSteps, autoregressive)
+        } catch (t: Throwable) {
+            Log.e(TAG, "FAIL: ${t.javaClass.name}: ${t.message}", t)
+            Result(false, "M3.5 status: FAIL\n${t.javaClass.name}: ${t.message}")
+        } finally {
+            stop()
+        }
+    }
+
+    private fun transcribeChunkLocked(context: Context, pcm16: ShortArray, sampleRate: Int, requestedSteps: Int, autoregressive: Boolean): Result {
+        return try {
             val tokenizer = WhisperTokenizer.fromAssets(context.assets)
             Log.i(TAG, "TOKENIZER_READY")
             val features = WhisperFeatureExtractor().extract(pcm16, sampleRate)
@@ -74,41 +171,14 @@ object QnnWhisperRealAudioRunner {
     }
 
     private fun runLoop(context: Context, features: FloatArray, pcmSamples: Int, sampleRate: Int, tokenizer: WhisperTokenizer, requestedSteps: Int, autoregressive: Boolean, diagnosticDir: File): Triple<String, IntArray, String> {
-        val encoderModel = copyAsset(context, "models/whisper/encoder_ctx.onnx")
         val encoderBinary = copyAsset(context, "models/whisper/encoder.bin")
-        val decoderModel = copyAsset(context, "models/whisper/decoder_ctx.onnx")
         val decoderBinary = copyAsset(context, "models/whisper/decoder.bin")
-        val env = OrtEnvironment.getEnvironment(OrtLoggingLevel.ORT_LOGGING_LEVEL_INFO, TAG)
+        val env = this.env ?: error("QNN runner is not started")
+        val encoderSession = this.encoderSession ?: error("encoder session not initialized")
+        val decoderSession = this.decoderSession ?: error("decoder session not initialized")
         val tensors = mutableListOf<OnnxTensor>()
-        var encoderSession: OrtSession? = null
-        var decoderSession: OrtSession? = null
-        var encoderOptions: OrtSession.SessionOptions? = null
-        var decoderOptions: OrtSession.SessionOptions? = null
         try {
-            // Keep the validated QnnWhisperStepRunner initialization and session contract.
-            System.loadLibrary("onnxruntime_providers_qnn")
-            env.registerExecutionProviderLibrary(EP_NAME, "libonnxruntime_providers_qnn.so")
-            val device = env.epDevices.firstOrNull { it.epName == EP_NAME } ?: error("QNN EP device not exposed")
-            val backend = File(context.applicationInfo.nativeLibraryDir, "libQnnHtp.so")
-            check(backend.isFile) { "HTP backend missing: ${backend.absolutePath}" }
-            val epOptions = mapOf(
-                "backend_path" to backend.absolutePath,
-                "soc_model" to "57",
-                "htp_arch" to "75",
-                "offload_graph_io_quantization" to "0",
-            )
-            fun makeOptions() = OrtSession.SessionOptions().apply {
-                addConfigEntry("session.disable_cpu_ep_fallback", "1")
-                setSessionLogLevel(OrtLoggingLevel.ORT_LOGGING_LEVEL_INFO)
-                addExecutionProvider(listOf(device), epOptions)
-            }
-            encoderOptions = makeOptions()
-            decoderOptions = makeOptions()
-            Log.i(TAG, "ENCODER_SESSION_CREATE_START")
-            encoderSession = env.createSession(encoderModel.absolutePath, encoderOptions)
-            Log.i(TAG, "ENCODER_SESSION_CREATE_DONE")
-            decoderSession = env.createSession(decoderModel.absolutePath, decoderOptions)
-
+            Log.i(TAG, "ENCODER_SESSION_REUSE")
             check(encoderSession.inputNames == setOf("input_features")) { "encoder inputs=${encoderSession.inputNames}" }
             check(encoderSession.outputNames.toSet() == crossNames.toSet()) { "encoder outputs=${encoderSession.outputNames}" }
             check(decoderSession.inputNames.size == 19) { "decoder inputs=${decoderSession.inputNames}" }
@@ -275,12 +345,8 @@ object QnnWhisperRealAudioRunner {
             }
             return Triple(report, generated.toIntArray(), decodedText)
         } finally {
+            // Per-chunk tensors are released here; QNN/ORT/Sessions stay alive until stop().
             tensors.asReversed().forEach { try { it.close() } catch (_: Throwable) {} }
-            try { encoderSession?.close() } catch (_: Throwable) {}
-            try { decoderSession?.close() } catch (_: Throwable) {}
-            try { encoderOptions?.close() } catch (_: Throwable) {}
-            try { decoderOptions?.close() } catch (_: Throwable) {}
-            try { env.unregisterExecutionProviderLibrary(EP_NAME) } catch (_: Throwable) { Unit }
         }
     }
 

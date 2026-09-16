@@ -85,6 +85,8 @@ fun MainScreen() {
             val chunk = ShortArray(samplesPerChunk)
             var offset = 0
             try {
+                QnnWhisperRealAudioRunner.start(context)
+                Log.i("WHISPER_DIAG", "QNN_SESSION_READY")
                 recorder.startRecording()
                 Log.i("WHISPER_DIAG", "AUDIO_RECORD_STARTED state=${recorder.recordingState} minBuffer=$minBuffer chunkSamples=$samplesPerChunk")
                 while (kotlinx.coroutines.currentCoroutineContext().isActive) {
@@ -100,7 +102,7 @@ fun MainScreen() {
                         withContext(Dispatchers.Main) { processing = true; status = "正在转录…" }
                         Log.i("WHISPER_DIAG", "TRANSCRIBE_START samples=${chunk.size} rate=$rate threads=2")
                         val text = runCatching {
-                            QnnWhisperRealAudioRunner.run(context, chunk.copyOf(), rate, requestedSteps = 12, autoregressive = true).also { result -> check(result.passed) { result.report } }.text.trim()
+                            QnnWhisperRealAudioRunner.transcribeChunk(context, chunk.copyOf(), rate, requestedSteps = 12, autoregressive = true).also { result -> check(result.passed) { result.report } }.text.trim()
                         }.onSuccess {
                             Log.i("WHISPER_DIAG", "NATIVE_RESULT chars=${it.length} text=${it.take(160)}")
                         }.onFailure {
@@ -125,6 +127,8 @@ fun MainScreen() {
             } finally {
                 runCatching { recorder.stop() }
                 recorder.release()
+                runCatching { QnnWhisperRealAudioRunner.stop() }
+                Log.i("WHISPER_DIAG", "QNN_SESSION_STOPPED")
             }
         }
     }
