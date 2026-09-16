@@ -11,8 +11,14 @@ import android.util.Log
 import com.example.whisperapp.asr.WhisperTokenizer
 import com.example.whisperapp.audio.WhisperFeatureExtractor
 import java.io.File
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.nio.IntBuffer
 import java.nio.ShortBuffer
+import java.security.MessageDigest
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import kotlin.math.max
 import kotlin.math.min
 
@@ -41,9 +47,25 @@ object QnnWhisperRealAudioRunner {
             val features = WhisperFeatureExtractor().extract(pcm16, sampleRate)
             Log.i(TAG, "MEL_READY shape=${features.shape.contentToString()}")
             val melStats = floatStats(features.data)
+            val diagnosticDir = createDiagnosticDir(context)
+            writePcmDiagnostic(diagnosticDir, pcm16, sampleRate)
+            writeFloat32(diagnosticDir.resolve("mel.bin"), features.data)
+            writeText(diagnosticDir.resolve("metadata.txt"), buildString {
+                appendLine("experiment_id=${diagnosticDir.name}")
+                appendLine("sample_rate=$sampleRate")
+                appendLine("pcm_samples=${pcm16.size}")
+                appendLine("padded_samples=${WhisperFeatureExtractor.CHUNK_SAMPLES}")
+                appendLine("threads=QNN_RUNTIME_DEFAULT")
+                appendLine("backend=QNNExecutionProvider")
+                appendLine("encoder_model=encoder_ctx.onnx")
+                appendLine("encoder_context_binary=encoder.bin")
+                appendLine("mel.dtype=float32")
+                appendLine("mel.elements=${features.data.size}")
+                appendLine("mel.shape=1x80x3000")
+            })
             LongAudioAppLogger.info("MEL_READY shape=${features.shape.contentToString()}")
             LongAudioAppLogger.info("MEL_STATS min=${melStats.min} max=${melStats.max} mean=${melStats.mean} finite=${melStats.finite} nan=${melStats.nan} inf=${melStats.inf} nonZero=${melStats.nonZero}")
-            val output = runLoop(context, features.data, pcm16.size, sampleRate, tokenizer, requestedSteps, autoregressive)
+            val output = runLoop(context, features.data, pcm16.size, sampleRate, tokenizer, requestedSteps, autoregressive, diagnosticDir)
             Result(true, output.first, output.second, output.third)
         } catch (t: Throwable) {
             Log.e(TAG, "FAIL: ${t.javaClass.name}: ${t.message}", t)
@@ -51,7 +73,7 @@ object QnnWhisperRealAudioRunner {
         }
     }
 
-    private fun runLoop(context: Context, features: FloatArray, pcmSamples: Int, sampleRate: Int, tokenizer: WhisperTokenizer, requestedSteps: Int, autoregressive: Boolean): Triple<String, IntArray, String> {
+    private fun runLoop(context: Context, features: FloatArray, pcmSamples: Int, sampleRate: Int, tokenizer: WhisperTokenizer, requestedSteps: Int, autoregressive: Boolean, diagnosticDir: File): Triple<String, IntArray, String> {
         val encoderModel = copyAsset(context, "models/whisper/encoder_ctx.onnx")
         val encoderBinary = copyAsset(context, "models/whisper/encoder.bin")
         val decoderModel = copyAsset(context, "models/whisper/decoder_ctx.onnx")
@@ -97,6 +119,9 @@ object QnnWhisperRealAudioRunner {
             val featureStats = floatStats(features)
             check(featureStats.nan == 0 && featureStats.inf == 0 && featureStats.nonZero > 0) { "feature stats=$featureStats" }
             val inputFeatures = f16FromFloat(env, features, longArrayOf(1, 80, 3000), tensors)
+            val inputShorts = ShortArray(features.size) { floatToHalf(features[it]) }
+            writeFloat16(diagnosticDir.resolve("encoder_input.bin"), inputShorts)
+            appendMetadata(diagnosticDir, "encoder_input.dtype=float16\nencoder_input.elements=${inputShorts.size}\nencoder_input.shape=1x80x3000\n")
             Log.i(TAG, "ENCODER_INPUT_READY shape=[1, 80, 3000] dtype=FP16")
             Log.i(TAG, "ENCODER_OUTPUT_READY names=${encoderSession.outputNames}")
             val crossInputs = LinkedHashMap<String, OnnxTensor>()
@@ -114,7 +139,13 @@ object QnnWhisperRealAudioRunner {
                     LongAudioAppLogger.info("ENCODER_OUTPUT_STATS name=$name shape=${shape.contentToString()} min=${stats.min} max=${stats.max} mean=${stats.mean} finite=${stats.finite} nan=${stats.nan} inf=${stats.inf} nonZero=${stats.nonZero}")
                     Log.i(TAG, "ENCODER_OUTPUT_READ $name shape=${shape.contentToString()} finite=${stats.finite} nan=${stats.nan} inf=${stats.inf}")
                     check(stats.nan == 0 && stats.inf == 0 && stats.nonZero > 0) { "$name invalid stats=$stats" }
-                    crossInputs[name] = copyHalfTensor(env, out, shape, tensors)
+                    val outputCopy = copyHalfTensor(env, out, shape, tensors)
+                    crossInputs[name] = outputCopy
+                    val outputBuffer = out.getShortBuffer().duplicate()
+                    val outputShorts = ShortArray(outputBuffer.remaining())
+                    outputBuffer.get(outputShorts)
+                    writeFloat16(diagnosticDir.resolve("encoder_output_${name}.bin"), outputShorts)
+                    appendMetadata(diagnosticDir, "encoder_output_${name}.dtype=float16\nencoder_output_${name}.elements=${outputShorts.size}\nencoder_output_${name}.shape=${shape.joinToString("x")}\n")
                     Log.i(TAG, "ENCODER_OUTPUT_FINITE $name=true")
                     Log.i(TAG, "ENCODER_CROSS $name shape=${shape.contentToString()} dtype=FP16 finite=${stats.finite} nan=${stats.nan} inf=${stats.inf}")
                 }
@@ -347,7 +378,16 @@ object QnnWhisperRealAudioRunner {
         return when {
             exponent <= 0 -> if (exponent < -10) sign.toShort() else (sign or ((mantissa or 0x800000) shr (1 - exponent + 13))).toShort()
             exponent >= 31 -> (sign or 0x7c00 or if (mantissa == 0) 0 else 0x0200).toShort()
-            else -> (sign or (exponent shl 10) or ((mantissa + 0x1000) shr 13)).toShort()
+            else -> {
+                var halfExponent = exponent
+                var halfMantissa = (mantissa + 0x1000) shr 13
+                if (halfMantissa == 0x400) {
+                    halfMantissa = 0
+                    halfExponent++
+                }
+                if (halfExponent >= 31) (sign or 0x7c00).toShort()
+                else (sign or (halfExponent shl 10) or halfMantissa).toShort()
+            }
         }
     }
 
@@ -366,5 +406,60 @@ object QnnWhisperRealAudioRunner {
         return values.sortedByDescending { it.second }.take(k)
     }
     private fun halfToFloat(bits: Int): Float { val sign = (bits ushr 15) and 1; val exp = (bits ushr 10) and 31; val frac = bits and 1023; val v = when (exp) { 0 -> frac / 1024.0f * Math.pow(2.0, -14.0).toFloat(); 31 -> if (frac == 0) Float.POSITIVE_INFINITY else Float.NaN; else -> (1f + frac / 1024f) * Math.pow(2.0, exp - 15.0).toFloat() }; return if (sign == 0) v else -v }
+    private fun createDiagnosticDir(context: Context): File {
+        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
+        return File(context.filesDir, "diagnostics/experiment_$stamp").apply { mkdirs() }
+    }
+
+    private fun writeText(file: File, text: String) {
+        file.writeText(text, Charsets.UTF_8)
+    }
+
+    private fun appendMetadata(dir: File, text: String) {
+        dir.resolve("metadata.txt").appendText(text, Charsets.UTF_8)
+    }
+
+    private fun writeFloat32(file: File, values: FloatArray) {
+        val buffer = ByteBuffer.allocate(values.size * 4).order(ByteOrder.LITTLE_ENDIAN)
+        values.forEach(buffer::putFloat)
+        file.writeBytes(buffer.array())
+    }
+
+    private fun writeFloat16(file: File, values: ShortArray) {
+        val buffer = ByteBuffer.allocate(values.size * 2).order(ByteOrder.LITTLE_ENDIAN)
+        values.forEach(buffer::putShort)
+        file.writeBytes(buffer.array())
+    }
+
+    private fun writePcmDiagnostic(dir: File, pcm16: ShortArray, sampleRate: Int) {
+        val padded = ShortArray(WhisperFeatureExtractor.CHUNK_SAMPLES)
+        pcm16.copyInto(padded, 0, 0, min(pcm16.size, padded.size))
+        val raw = ByteBuffer.allocate(pcm16.size * 2).order(ByteOrder.LITTLE_ENDIAN)
+        pcm16.forEach(raw::putShort)
+        val paddedRaw = ByteBuffer.allocate(padded.size * 2).order(ByteOrder.LITTLE_ENDIAN)
+        padded.forEach(paddedRaw::putShort)
+        dir.resolve("pcm.bin").writeBytes(raw.array())
+        dir.resolve("pcm_padded.bin").writeBytes(paddedRaw.array())
+        val sha = MessageDigest.getInstance("SHA-256").digest(raw.array()).joinToString("") { "%02X".format(it) }
+        val paddedSha = MessageDigest.getInstance("SHA-256").digest(paddedRaw.array()).joinToString("") { "%02X".format(it) }
+        val stats = floatStats(FloatArray(pcm16.size) { pcm16[it].toFloat() })
+        writeText(dir.resolve("pcm_stats.txt"), buildString {
+            appendLine("sample_count=${pcm16.size}")
+            appendLine("sample_rate=$sampleRate")
+            appendLine("first16=${pcm16.take(16).joinToString(",")}")
+            appendLine("last16=${pcm16.takeLast(16).joinToString(",")}")
+            appendLine("min=${stats.min}")
+            appendLine("max=${stats.max}")
+            appendLine("mean=${stats.mean}")
+            appendLine("rms=${kotlin.math.sqrt(pcm16.fold(0.0) { acc, v -> acc + v.toDouble() * v.toDouble() } / pcm16.size)}")
+            appendLine("sha256_raw_pcm=$sha")
+            appendLine("padded_count=${padded.size}")
+            appendLine("padded_zero_count=${padded.count { it == 0.toShort() } - pcm16.take(padded.size).count { it == 0.toShort() }}")
+            appendLine("sha256_padded_pcm=$paddedSha")
+            appendLine("first_padded=${padded.firstOrNull() ?: 0}")
+            appendLine("last_padded=${padded.lastOrNull() ?: 0}")
+        })
+    }
+
     private fun copyAsset(context: Context, asset: String): File { val f = File(context.cacheDir, asset.substringAfterLast('/')); context.assets.open(asset).use { input -> f.outputStream().use { output -> input.copyTo(output) } }; return f }
 }
