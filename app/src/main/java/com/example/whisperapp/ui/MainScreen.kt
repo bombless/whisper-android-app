@@ -30,6 +30,8 @@ import com.example.whisperapp.tts.VoiceAiTtsEngine
 import com.example.whisperapp.tts.TtsQueue
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
@@ -38,12 +40,15 @@ import kotlinx.coroutines.withContext
 fun MainScreen() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    var selectedTab by remember { mutableIntStateOf(0) }
+    var ttsText by remember { mutableStateOf("") }
+    var ttsStatus by remember { mutableStateOf("输入文字后点击播放") }
     var recording by remember { mutableStateOf(false) }
     var processing by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf("点击开始，说话即可实时转录") }
-    var ttsEnabled by remember { mutableStateOf(true) }
     val transcript = remember { mutableStateListOf<String>() }
     var recordingJob by remember { mutableStateOf<Job?>(null) }
+    val recordingLifecycleMutex = remember { Mutex() }
     var previousWhisperText by remember { mutableStateOf("") }
     val audioPlayer = remember { AudioPlayer() }
     val ttsEngine = remember { VoiceAiTtsEngine(context) }
@@ -59,7 +64,6 @@ fun MainScreen() {
         Log.i("WHISPER_DIAG", "RECORD_STOP recordingJob=${recordingJob != null}")
         recording = false
         recordingJob?.cancel()
-        recordingJob = null
         processing = false
         previousWhisperText = ""
         ttsQueue.clearAndStop()
@@ -74,6 +78,7 @@ fun MainScreen() {
         recording = true
         status = "正在监听…"
         recordingJob = scope.launch(Dispatchers.IO) {
+            recordingLifecycleMutex.withLock {
             val rate = 16_000
             val samplesPerChunk = rate * 5
             val minBuffer = AudioRecord.getMinBufferSize(rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
@@ -113,10 +118,6 @@ fun MainScreen() {
                             Log.i("WHISPER_DIAG", "UI_UPDATE rawChars=${text.length} normalizedChars=${normalized.length} blank=${normalized.isBlank()}")
                             if (normalized.isNotBlank()) {
                                 transcript.add(normalized)
-                                if (ttsEnabled) {
-                                    val newText = ChineseTextProcessor.incrementalNewText(previousWhisperText, normalized)
-                                    ChineseTextProcessor.splitSentences(newText).forEach(ttsQueue::offer)
-                                }
                                 previousWhisperText = normalized
                             }
                             processing = false
@@ -132,6 +133,7 @@ fun MainScreen() {
             }
         }
     }
+    }
 
     val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) start() else status = "需要麦克风权限才能转录"
@@ -146,52 +148,76 @@ fun MainScreen() {
     }
 
     Surface(Modifier.fillMaxSize()) {
-        Column(Modifier.fillMaxSize().padding(20.dp), verticalArrangement = Arrangement.SpaceBetween) {
-            Column(Modifier.fillMaxWidth()) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Box(Modifier.size(12.dp).background(if (recording) Color(0xFF42A85F) else MaterialTheme.colorScheme.outline, CircleShape))
-                    Spacer(Modifier.width(10.dp))
-                    Text("实时转录", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.SemiBold)
+        Column(Modifier.fillMaxSize().padding(20.dp)) {
+            TabRow(selectedTabIndex = selectedTab) {
+                Tab(selected = selectedTab == 0, onClick = { selectedTab = 0 }, text = { Text("文字转语音") })
+                Tab(selected = selectedTab == 1, onClick = { selectedTab = 1 }, text = { Text("语音转文字") })
+            }
+            Spacer(Modifier.height(20.dp))
+            if (selectedTab == 0) {
+                Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.SpaceBetween) {
+                    Column(Modifier.fillMaxWidth()) {
+                        Text("文字转语音", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.SemiBold)
+                        Spacer(Modifier.height(8.dp))
+                        Text(ttsStatus, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Spacer(Modifier.height(20.dp))
+                        OutlinedTextField(
+                            value = ttsText,
+                            onValueChange = { ttsText = it },
+                            modifier = Modifier.fillMaxWidth().height(280.dp),
+                            placeholder = { Text("输入要朗读的中文文字") },
+                            label = { Text("朗读文本") },
+                        )
+                    }
+                    Button(
+                        onClick = {
+                            val text = ttsText.trim()
+                            if (text.isBlank()) ttsStatus = "请先输入文字"
+                            else {
+                                ttsStatus = "已加入播放"
+                                ttsQueue.offer(text)
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth().height(56.dp),
+                        shape = RoundedCornerShape(18.dp),
+                    ) { Text("播放语音") }
                 }
-                Spacer(Modifier.height(8.dp))
-                Text(status, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Spacer(Modifier.height(24.dp))
-                Surface(Modifier.fillMaxWidth().height(420.dp), shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.surfaceVariant) {
-                    if (transcript.isEmpty()) {
-                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("你的语音会出现在这里", color = MaterialTheme.colorScheme.onSurfaceVariant) }
-                    } else {
-                        LazyColumn(Modifier.fillMaxSize().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                            items(transcript) { line -> Text(line, style = MaterialTheme.typography.bodyLarge) }
+            } else {
+                Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.SpaceBetween) {
+                    Column(Modifier.fillMaxWidth()) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Box(Modifier.size(12.dp).background(if (recording) Color(0xFF42A85F) else MaterialTheme.colorScheme.outline, CircleShape))
+                            Spacer(Modifier.width(10.dp))
+                            Text("语音转文字", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.SemiBold)
+                        }
+                        Spacer(Modifier.height(8.dp))
+                        Text(status, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Spacer(Modifier.height(24.dp))
+                        Surface(Modifier.fillMaxWidth().height(420.dp), shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.surfaceVariant) {
+                            if (transcript.isEmpty()) {
+                                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("你的语音会出现在这里", color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                            } else {
+                                LazyColumn(Modifier.fillMaxSize().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                                    items(transcript) { line -> Text(line, style = MaterialTheme.typography.bodyLarge) }
+                                }
+                            }
                         }
                     }
+                    Column(Modifier.fillMaxWidth()) {
+                        Button(
+                            onClick = {
+                                if (recording) stop()
+                                else if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) start()
+                                else permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                            },
+                            modifier = Modifier.fillMaxWidth().height(56.dp),
+                            shape = RoundedCornerShape(18.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = if (recording) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary)
+                        ) { Text(if (recording) "停止转录" else "开始说话") }
+                        Spacer(Modifier.height(8.dp))
+                        Text("Whisper Tiny · 16 kHz · 每 5 秒更新一次", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelMedium)
+                    }
                 }
-            }
-            Column(Modifier.fillMaxWidth()) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                ) {
-                    Text("中文朗读", style = MaterialTheme.typography.bodyLarge)
-                    Switch(checked = ttsEnabled, onCheckedChange = { enabled ->
-                        ttsEnabled = enabled
-                        if (!enabled) ttsQueue.clearAndStop()
-                    })
-                }
-                Spacer(Modifier.height(8.dp))
-                Button(
-                    onClick = {
-                        if (recording) stop()
-                        else if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) start()
-                        else permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-                    },
-                    enabled = true,
-                    modifier = Modifier.fillMaxWidth().height(56.dp),
-                    shape = RoundedCornerShape(18.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = if (recording) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary)
-                ) { Text(if (recording) "停止转录" else "开始说话") }
-                Spacer(Modifier.height(8.dp))
-                Text("Whisper Tiny · 16 kHz · 每 5 秒更新一次", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelMedium)
             }
         }
     }

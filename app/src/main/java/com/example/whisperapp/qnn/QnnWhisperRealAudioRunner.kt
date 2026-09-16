@@ -52,13 +52,19 @@ object QnnWhisperRealAudioRunner {
             val appContext = context.applicationContext
             val encoderModel = copyAsset(appContext, "models/whisper/encoder_ctx.onnx")
             val decoderModel = copyAsset(appContext, "models/whisper/decoder_ctx.onnx")
-            env = OrtEnvironment.getEnvironment(OrtLoggingLevel.ORT_LOGGING_LEVEL_INFO, TAG)
+            if (env == null) {
+                env = OrtEnvironment.getEnvironment(OrtLoggingLevel.ORT_LOGGING_LEVEL_INFO, TAG)
+                Log.i(TAG, "QNN_LIFECYCLE INIT_ORT")
+            }
             val runtimeEnv = env!!
-            Log.i(TAG, "QNN_LIFECYCLE INIT_ORT")
-            System.loadLibrary("onnxruntime_providers_qnn")
-            runtimeEnv.registerExecutionProviderLibrary(EP_NAME, "libonnxruntime_providers_qnn.so")
-            qnnRegistered = true
-            Log.i(TAG, "QNN_LIFECYCLE REGISTER_EP")
+            if (!qnnRegistered) {
+                System.loadLibrary("onnxruntime_providers_qnn")
+                runtimeEnv.registerExecutionProviderLibrary(EP_NAME, "libonnxruntime_providers_qnn.so")
+                qnnRegistered = true
+                Log.i(TAG, "QNN_LIFECYCLE REGISTER_EP")
+            } else {
+                Log.i(TAG, "QNN_LIFECYCLE REUSE_EP")
+            }
             val device = runtimeEnv.epDevices.firstOrNull { it.epName == EP_NAME } ?: error("QNN EP device not exposed")
             val backend = File(appContext.applicationInfo.nativeLibraryDir, "libQnnHtp.so")
             check(backend.isFile) { "HTP backend missing: ${backend.absolutePath}" }
@@ -106,19 +112,12 @@ object QnnWhisperRealAudioRunner {
             Log.i(TAG, "QNN_LIFECYCLE CLOSE_ENCODER")
             try { decoderOptions?.close() } catch (_: Throwable) {}
             try { encoderOptions?.close() } catch (_: Throwable) {}
-            if (qnnRegistered) {
-                try { env?.unregisterExecutionProviderLibrary(EP_NAME) } catch (_: Throwable) {}
-                Log.i(TAG, "QNN_LIFECYCLE UNREGISTER_EP")
-            }
-            try { env?.close() } catch (_: Throwable) {}
-            Log.i(TAG, "QNN_LIFECYCLE CLOSE_ENV")
             decoderSession = null
             encoderSession = null
             decoderOptions = null
             encoderOptions = null
-            env = null
-            qnnRegistered = false
             lifecycleChunk = 0
+            Log.i(TAG, "QNN_LIFECYCLE STOP_DONE ENV_EP_RETAINED")
         }
     }
 
