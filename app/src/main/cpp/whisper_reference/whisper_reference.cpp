@@ -493,9 +493,9 @@ Java_com_example_whisperapp_qnn_WhisperReferenceRunner_transcribeNative(JNIEnv *
         if (!ctx) throw std::runtime_error("whisper_init_from_file failed");
         whisper_full_params params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
         params.print_progress = false; params.print_special = false; params.print_realtime = false; params.print_timestamps = false;
-        params.translate = false; params.no_context = true; params.language = "en"; params.n_threads = std::max(1, static_cast<int>(threads));
+        params.translate = false; params.no_context = true; params.language = "zh"; params.n_threads = std::max(1, static_cast<int>(threads));
         if (whisper_full(ctx, params, samples.data(), static_cast<int>(samples.size())) != 0) throw std::runtime_error("whisper_full failed");
-        std::ostringstream out; out << "WHISPER_TRANSCRIBE_TEXT ";
+        std::ostringstream out;
         const int n_segments = whisper_full_n_segments(ctx);
         for (int i = 0; i < n_segments; ++i) { const char * text = whisper_full_get_segment_text(ctx, i); if (text) out << text; }
         out << "\nWHISPER_TRANSCRIBE_DONE segments=" << n_segments << "\n";
