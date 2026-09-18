@@ -1,6 +1,6 @@
 [submodule "tools/whisper.cpp"]
 	path = tools/whisper.cpp
 	url = https://github.com/bombless/whisper.cpp.git
-[submodule "app/src/main/jniLibs"]
-	path = app/src/main/jniLibs
+[submodule "lib"]
+	path = lib
 	url = git@github.com:bombless/whisper-android-app-lib.git

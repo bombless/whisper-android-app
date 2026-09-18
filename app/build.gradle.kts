@@ -11,6 +11,11 @@ android {
 
     packaging {
         jniLibs.useLegacyPackaging = true
+        jniLibs.pickFirsts += setOf(
+            "**/libsherpa-onnx-c-api.so",
+            "**/libsherpa-onnx-cxx-api.so",
+            "**/libsherpa-onnx-jni.so",
+        )
     }
 
     defaultConfig {
@@ -48,11 +53,18 @@ android {
     }
     kotlinOptions { jvmTarget = "17" }
     buildFeatures { compose = true }
+
+    sourceSets {
+        getByName("main") {
+            assets.srcDir(file("../lib/assets"))
+            jniLibs.srcDir(file("../lib/runtime/jniLibs"))
+        }
+    }
 }
 
 dependencies {
-    implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("*.jar"))))
-    implementation(files("libs/sherpa-onnx-1.13.8-no-ort.aar"))
+    implementation(fileTree(mapOf("dir" to "../lib/runtime", "include" to listOf("*.jar"))))
+    implementation(files("../lib/runtime/sherpa-onnx-1.13.8-no-ort.aar"))
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.27.0")
     implementation("com.qualcomm.qti:onnxruntime-android-qnn:2.6.0")
     implementation("com.qualcomm.qti:qnn-runtime:2.50.0")

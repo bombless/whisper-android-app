@@ -12,7 +12,7 @@ class WhisperTokenizerDecodeTest {
 
     @Before
     fun setUp() {
-        val tokenizerDir = File("src/main/assets/models/whisper/tokenizer")
+        val tokenizerDir = File("../lib/assets/models/whisper/tokenizer")
         tokenizer = WhisperTokenizer.fromAssetTexts(
             File(tokenizerDir, "vocab.json").readText(),
             File(tokenizerDir, "merges.txt").readText(),

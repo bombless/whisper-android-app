@@ -10,7 +10,7 @@ import kotlin.math.PI
 import kotlin.math.sin
 
 class M35ContractTest {
-    private val tokenizerDir = File("src/main/assets/models/whisper/tokenizer")
+    private val tokenizerDir = File("../lib/assets/models/whisper/tokenizer")
 
     @Test
     fun tokenizerAssetsEncodeDecodeEnglishSmoke() {
