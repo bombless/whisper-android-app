@@ -52,6 +52,7 @@ android {
 
 dependencies {
     implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("*.jar"))))
+    implementation(files("libs/sherpa-onnx-1.13.8-no-ort.aar"))
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.27.0")
     implementation("com.qualcomm.qti:onnxruntime-android-qnn:2.6.0")
     implementation("com.qualcomm.qti:qnn-runtime:2.50.0")
@@ -66,3 +67,4 @@ dependencies {
     testImplementation(kotlin("test"))
     testImplementation("junit:junit:4.13.2")
 }
+

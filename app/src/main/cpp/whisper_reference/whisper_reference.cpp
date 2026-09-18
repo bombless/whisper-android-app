@@ -30,7 +30,8 @@ constexpr int kModelSamples = 480000;
 constexpr int kSteps = 5;
 constexpr int kTopK = 5;
 constexpr whisper_token kEos = 50257;
-constexpr whisper_token kPrompt[] = {50258, 50259, 50359, 50363};
+// <|zh|> is token 50260; the previous prompt forced English.
+constexpr whisper_token kPrompt[] = {50258, 50260, 50359, 50363};
 
 struct Pair { int id; float value; };
 

@@ -1,6 +1,7 @@
 package com.example.whisperapp.tts
 
 interface TtsEngine {
+    suspend fun prepare() {}
     suspend fun synthesize(text: String): TtsResult
     fun close()
 }

@@ -26,9 +26,14 @@ object QnnWhisperRealAudioRunner {
     private const val TAG = "QNN_WHISPER_REAL"
     private const val EP_NAME = "QNNExecutionProvider"
     private const val EOS_TOKEN = 50257
+    private const val START_OF_TRANSCRIPT_TOKEN = 50258
+    private const val ZH_LANGUAGE_TOKEN = 50260
+    private const val TRANSCRIBE_TOKEN = 50359
+    private const val NO_TIMESTAMPS_TOKEN = 50363
     private const val MAX_STEPS = 16
     private const val MAX_GENERATION_STEPS = 32
-    private val forcedPrompt = intArrayOf(50258, 50259, 50359, 50363)
+    // Whisper language token: <|zh|>; the previous prompt forced English.
+    private val forcedPrompt = intArrayOf(START_OF_TRANSCRIPT_TOKEN, ZH_LANGUAGE_TOKEN, TRANSCRIBE_TOKEN, NO_TIMESTAMPS_TOKEN)
     private val crossNames = (0 until 4).flatMap { listOf("k_cache_cross_$it", "v_cache_cross_$it") }
     private val selfInNames = (0 until 4).flatMap { listOf("k_cache_self_${it}_in", "v_cache_self_${it}_in") }
     private val selfOutNames = (0 until 4).flatMap { listOf("k_cache_self_${it}_out", "v_cache_self_${it}_out") }
@@ -52,6 +57,18 @@ object QnnWhisperRealAudioRunner {
             val appContext = context.applicationContext
             val encoderModel = copyAsset(appContext, "models/whisper/encoder_ctx.onnx")
             val decoderModel = copyAsset(appContext, "models/whisper/decoder_ctx.onnx")
+            // EPContext wrappers use a relative ep_cache_context (encoder.bin / decoder.bin).
+            // ORT resolves that path relative to the wrapper ONNX file, so the binaries must
+            // already exist beside the copied wrapper before createSession() is called.
+            val encoderBinary = copyAsset(appContext, "models/whisper/encoder.bin")
+            val decoderBinary = copyAsset(appContext, "models/whisper/decoder.bin")
+            check(encoderBinary.isFile && encoderBinary.length() > 0) {
+                "Encoder EPContext binary missing: ${encoderBinary.absolutePath}"
+            }
+            check(decoderBinary.isFile && decoderBinary.length() > 0) {
+                "Decoder EPContext binary missing: ${decoderBinary.absolutePath}"
+            }
+            Log.i(TAG, "QNN_LIFECYCLE CONTEXT_BINARIES encoder=${encoderBinary.length()} decoder=${decoderBinary.length()}")
             if (env == null) {
                 env = OrtEnvironment.getEnvironment(OrtLoggingLevel.ORT_LOGGING_LEVEL_INFO, TAG)
                 Log.i(TAG, "QNN_LIFECYCLE INIT_ORT")
@@ -70,7 +87,9 @@ object QnnWhisperRealAudioRunner {
             check(backend.isFile) { "HTP backend missing: ${backend.absolutePath}" }
             val epOptions = mapOf("backend_path" to backend.absolutePath, "soc_model" to "57", "htp_arch" to "75", "offload_graph_io_quantization" to "0")
             fun makeOptions() = OrtSession.SessionOptions().apply {
-                addConfigEntry("session.disable_cpu_ep_fallback", "1")
+                // EPContext wrapper graphs contain a small CPU-side IO adapter (notably
+                // QuantizeLinear/DequantizeLinear). Disabling CPU fallback makes session
+                // creation fail before recording even starts when those nodes are left on CPU.
                 setSessionLogLevel(OrtLoggingLevel.ORT_LOGGING_LEVEL_INFO)
                 addExecutionProvider(listOf(device), epOptions)
             }
