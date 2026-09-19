@@ -1,6 +1,7 @@
 package com.example.whisperapp.audio
 
 import kotlin.math.PI
+import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.ln
 import kotlin.math.log10
@@ -29,6 +30,27 @@ class WhisperFeatureExtractor {
         const val N_MELS = 80
         const val N_FRAMES = 3000
         const val CHUNK_SAMPLES = SAMPLE_RATE * 30
+
+        /** Max float-mel deviation vs the Java reference before we permanently fall back. */
+        private const val NATIVE_TOLERANCE = 0.05f
+
+        @Volatile private var nativeLibLoaded = false
+        @Volatile private var nativeValidationDone = false
+        @Volatile private var nativeUsable = false
+
+        init {
+            nativeLibLoaded = try {
+                System.loadLibrary("mel_native")
+                true
+            } catch (t: Throwable) {
+                // Deliberately silent on JVM unit tests (android.util.Log is not mocked there).
+                System.err.println("mel_native unavailable, Java mel path will be used: $t")
+                false
+            }
+        }
+
+        private external fun nativeExtractFloat(pcm: ShortArray, sampleRate: Int): FloatArray
+        private external fun nativeExtractHalf(pcm: ShortArray, sampleRate: Int): ShortArray
     }
 
     private val fftSize = 1024 // Bluestein convolution size for n_fft=400
@@ -95,11 +117,7 @@ class WhisperFeatureExtractor {
     }
 
     fun extract(pcm16: ShortArray, sampleRate: Int): WhisperFeatures {
-        val mel = computeMel(pcm16, sampleRate)
-        var maxLog = Float.NEGATIVE_INFINITY
-        for (i in mel.indices) { mel[i] = log10(mel[i]); maxLog = max(maxLog, mel[i]) }
-        val floor = maxLog - 8f
-        for (i in mel.indices) mel[i] = (max(mel[i], floor) + 4f) / 4f
+        val mel = extractNormalizedMel(pcm16, sampleRate)
         require(mel.all { it.isFinite() }) { "Whisper features contain NaN/Inf" }
         require(mel.any { it != 0f }) { "Whisper features are all zero" }
         return WhisperFeatures(mel)
@@ -107,13 +125,86 @@ class WhisperFeatureExtractor {
 
     /** Same pipeline as [extract] but returns FP16 samples ready for the encoder input. */
     fun extractHalf(pcm16: ShortArray, sampleRate: Int): ShortArray {
+        if (nativeReady(pcm16, sampleRate)) {
+            val out = try {
+                nativeExtractHalf(pcm16, sampleRate)
+            } catch (t: Throwable) {
+                android.util.Log.e("WhisperFeatureExtractor", "nativeExtractHalf failed, falling back", t)
+                null
+            }
+            if (out != null && out.size == N_MELS * N_FRAMES && out.any { it.toInt() != 0 }) return out
+            nativeUsable = false
+            android.util.Log.e("WhisperFeatureExtractor", "native half output invalid, falling back to Java mel")
+        }
+        val mel = javaNormalizedMel(pcm16, sampleRate)
+        val result = ShortArray(mel.size)
+        for (i in mel.indices) result[i] = floatToHalf(mel[i])
+        return result
+    }
+
+    /**
+     * Returns log-mel normalized per whisper's (log10, max-8 floor, +4 /4) contract,
+     * preferring the JNI native implementation once it has been validated against the
+     * Java reference on real audio.
+     */
+    private fun extractNormalizedMel(pcm16: ShortArray, sampleRate: Int): FloatArray {
+        if (nativeReady(pcm16, sampleRate)) {
+            val out = try {
+                nativeExtractFloat(pcm16, sampleRate)
+            } catch (t: Throwable) {
+                android.util.Log.e("WhisperFeatureExtractor", "nativeExtractFloat failed, falling back", t)
+                null
+            }
+            if (out != null && out.size == N_MELS * N_FRAMES && out.all { it.isFinite() }) return out
+            nativeUsable = false
+            android.util.Log.e("WhisperFeatureExtractor", "native float output invalid, falling back to Java mel")
+        }
+        return javaNormalizedMel(pcm16, sampleRate)
+    }
+
+    private fun javaNormalizedMel(pcm16: ShortArray, sampleRate: Int): FloatArray {
         val mel = computeMel(pcm16, sampleRate)
+        for (i in mel.indices) mel[i] = log10(mel[i])
+        val floor = melMaxLog(mel) - 8f
+        for (i in mel.indices) mel[i] = (max(mel[i], floor) + 4f) / 4f
+        return mel
+    }
+
+    private fun melMaxLog(mel: FloatArray): Float {
         var maxLog = Float.NEGATIVE_INFINITY
-        for (i in mel.indices) { mel[i] = log10(mel[i]); maxLog = max(maxLog, mel[i]) }
-        val floor = maxLog - 8f
-        val out = ShortArray(mel.size)
-        for (i in mel.indices) out[i] = floatToHalf((max(mel[i], floor) + 4f) / 4f)
-        return out
+        for (v in mel) maxLog = max(maxLog, v)
+        return maxLog
+    }
+
+    /** True iff the native library is loaded and (on first use) validated vs the Java reference. */
+    @Synchronized
+    private fun nativeReady(pcm16: ShortArray, sampleRate: Int): Boolean {
+        if (!nativeLibLoaded) return false
+        if (nativeValidationDone) return nativeUsable
+        nativeValidationDone = true
+        return try {
+            val ref = javaNormalizedMel(pcm16, sampleRate)
+            val nat = nativeExtractFloat(pcm16, sampleRate)
+            var maxDiff = 0f
+            if (nat.size == ref.size) {
+                for (i in ref.indices) maxDiff = max(maxDiff, abs(ref[i] - nat[i]))
+            }
+            if (nat.size == ref.size && maxDiff <= NATIVE_TOLERANCE) {
+                nativeUsable = true
+                android.util.Log.i("WhisperFeatureExtractor", "native mel validated, maxAbsDiff=$maxDiff")
+            } else {
+                nativeUsable = false
+                android.util.Log.e(
+                    "WhisperFeatureExtractor",
+                    "native mel mismatch (size ${nat.size} vs ${ref.size}, maxAbsDiff=$maxDiff), falling back to Java"
+                )
+            }
+            nativeUsable
+        } catch (t: Throwable) {
+            nativeUsable = false
+            android.util.Log.e("WhisperFeatureExtractor", "native mel validation crashed, falling back", t)
+            false
+        }
     }
 
     private fun computeMel(pcm16: ShortArray, sampleRate: Int): FloatArray {

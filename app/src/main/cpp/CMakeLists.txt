@@ -32,3 +32,11 @@ target_include_directories(whisper_reference PRIVATE
 target_link_libraries(whisper_reference PRIVATE whisper log android)
 
 target_compile_options(whisper_reference PRIVATE -fvisibility=hidden)
+
+# Native mel spectrogram (production hot path; mirrors Java WhisperFeatureExtractor).
+add_library(mel_native SHARED
+    mel/mel_native.cpp
+)
+target_compile_features(mel_native PRIVATE cxx_std_17)
+target_compile_options(mel_native PRIVATE -O3 -fvisibility=hidden)
+target_link_libraries(mel_native PRIVATE log)
