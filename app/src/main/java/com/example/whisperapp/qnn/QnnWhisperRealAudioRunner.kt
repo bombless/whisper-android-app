@@ -160,7 +160,12 @@ object QnnWhisperRealAudioRunner {
             check(encoderSession!!.outputNames.toSet() == crossNames.toSet()) { "encoder outputs=${encoderSession!!.outputNames}" }
             check(decoderSession!!.inputNames.size == 19) { "decoder inputs=${decoderSession!!.inputNames}" }
             check(decoderSession!!.outputNames.toSet() == (selfOutNames + "logits").toSet()) { "decoder outputs=${decoderSession!!.outputNames}" }
-            validateDecoderContract(decoderSession!!)
+            if (debugDiagnostics) validateDecoderContract(decoderSession!!)
+            // Preload the tokenizer so the first transcribed chunk doesn't pay ~750 ms of
+            // vocab parsing inside the real-time loop; chunks 2+ reuse the cached instance.
+            OpTrace.time("tokenizer.preload", "init") {
+                cachedTokenizer ?: WhisperTokenizer.fromAssets(appContext.assets).also { cachedTokenizer = it }
+            }
             lifecycleChunk = 0
         }
     }
@@ -220,29 +225,37 @@ object QnnWhisperRealAudioRunner {
                 cachedTokenizer ?: WhisperTokenizer.fromAssets(context.assets).also { cachedTokenizer = it }
             }
             Log.i(TAG, "TOKENIZER_READY cached=${cachedTokenizer != null}")
-            val features = OpTrace.time("mel.extract", "preprocess") {
-                WhisperFeatureExtractor().extract(pcm16, sampleRate)
+            val extractor = WhisperFeatureExtractor()
+            val melFloat: FloatArray?
+            val melHalf: ShortArray?
+            if (debugDiagnostics) {
+                melFloat = OpTrace.time("mel.extract", "preprocess") { extractor.extract(pcm16, sampleRate).data }
+                melHalf = null
+            } else {
+                melFloat = null
+                melHalf = OpTrace.time("mel.extract", "preprocess") { extractor.extractHalf(pcm16, sampleRate) }
             }
-            Log.i(TAG, "MEL_READY shape=${features.shape.contentToString()}")
-            val melStats = if (debugDiagnostics) floatStats(features.data) else null
+            val melSize = melFloat?.size ?: melHalf!!.size
+            Log.i(TAG, "MEL_READY elements=$melSize half=${melHalf != null}")
+            val melStats = if (debugDiagnostics) floatStats(melFloat!!) else null
             val diagnosticDir = if (debugDiagnostics) createDiagnosticDir(context) else context.cacheDir
             if (debugDiagnostics) {
                 LongAudioAppLogger.info("MEL_STATS min=${melStats!!.min} max=${melStats.max} mean=${melStats.mean} finite=${melStats.finite} nan=${melStats.nan} inf=${melStats.inf} nonZero=${melStats.nonZero}")
                 OpTrace.time("diagnostics.write", "preprocess") {
                     writePcmDiagnostic(diagnosticDir, pcm16, sampleRate)
-                    writeFloat32(diagnosticDir.resolve("mel.bin"), features.data)
+                    writeFloat32(diagnosticDir.resolve("mel.bin"), melFloat!!)
                 }
                 writeText(diagnosticDir.resolve("metadata.txt"), buildString {
                     appendLine("experiment_id=debug")
                     appendLine("sample_rate=$sampleRate")
                     appendLine("pcm_samples=${pcm16.size}")
                     appendLine("mel.dtype=float32")
-                    appendLine("mel.elements=${features.data.size}")
+                    appendLine("mel.elements=$melSize")
                     appendLine("mel.shape=1x80x3000")
                 })
             }
-            LongAudioAppLogger.info("MEL_READY shape=${features.shape.contentToString()}")
-            val output = runLoop(context, features.data, pcm16.size, sampleRate, tokenizer, requestedSteps, autoregressive, diagnosticDir)
+            LongAudioAppLogger.info("MEL_READY elements=$melSize half=${melHalf != null}")
+            val output = runLoop(context, melFloat, melHalf, pcm16.size, sampleRate, tokenizer, requestedSteps, autoregressive, diagnosticDir)
             Result(true, output.first, output.second, output.third)
         } catch (t: Throwable) {
             Log.e(TAG, "FAIL: ${t.javaClass.name}: ${t.message}", t)
@@ -250,7 +263,7 @@ object QnnWhisperRealAudioRunner {
         }
     }
 
-    private fun runLoop(context: Context, features: FloatArray, pcmSamples: Int, sampleRate: Int, tokenizer: WhisperTokenizer, requestedSteps: Int, autoregressive: Boolean, diagnosticDir: File): Triple<String, IntArray, String> {
+    private fun runLoop(context: Context, melFloat: FloatArray?, melHalf: ShortArray?, pcmSamples: Int, sampleRate: Int, tokenizer: WhisperTokenizer, requestedSteps: Int, autoregressive: Boolean, diagnosticDir: File): Triple<String, IntArray, String> {
         val encoderBinary = copyAsset(context, "models/whisper/encoder.bin")
         val decoderBinary = copyAsset(context, "models/whisper/decoder.bin")
         val env = this.env ?: error("QNN runner is not started")
@@ -263,15 +276,24 @@ object QnnWhisperRealAudioRunner {
             check(encoderSession.outputNames.toSet() == crossNames.toSet()) { "encoder outputs=${encoderSession.outputNames}" }
             check(decoderSession.inputNames.size == 19) { "decoder inputs=${decoderSession.inputNames}" }
             check(decoderSession.outputNames.toSet() == (selfOutNames + "logits").toSet()) { "decoder outputs=${decoderSession.outputNames}" }
-            validateDecoderContract(decoderSession)
+            if (debugDiagnostics) validateDecoderContract(decoderSession)
 
-            check(features.size == 1 * 80 * 3000) { "feature element count=${features.size}" }
-            val featureStats = floatStats(features)
-            check(featureStats.nan == 0 && featureStats.inf == 0 && featureStats.nonZero > 0) { "feature stats=$featureStats" }
-            val inputFeatures = OpTrace.time("fp32_to_fp16", "preprocess", mapOf("elements" to features.size.toString())) {
-                f16FromFloat(env, features, longArrayOf(1, 80, 3000), tensors)
+            check((melFloat?.size ?: melHalf!!.size) == 1 * 80 * 3000) { "feature element count mismatch" }
+            val featureStats = if (debugDiagnostics) {
+                val s = floatStats(melFloat!!)
+                check(s.nan == 0 && s.inf == 0 && s.nonZero > 0) { "feature stats=$s" }
+                s
+            } else null
+            val inputFeatures = if (melHalf != null) {
+                // FP16 path: the extractor already produced binary16 samples.
+                OnnxTensor.createTensor(env, ShortBuffer.wrap(melHalf), longArrayOf(1, 80, 3000), OnnxJavaType.FLOAT16)
+                    .also { tensors += it }
+            } else {
+                OpTrace.time("fp32_to_fp16", "preprocess", mapOf("elements" to melFloat!!.size.toString())) {
+                    f16FromFloat(env, melFloat, longArrayOf(1, 80, 3000), tensors)
+                }
             }
-            val inputShorts = if (debugDiagnostics) ShortArray(features.size) { floatToHalf(features[it]) } else null
+            val inputShorts = if (debugDiagnostics) melHalf ?: ShortArray(melFloat!!.size) { floatToHalf(melFloat[it]) } else null
             if (debugDiagnostics) {
                 writeFloat16(diagnosticDir.resolve("encoder_input.bin"), inputShorts!!)
                 appendMetadata(diagnosticDir, "encoder_input.dtype=float16\nencoder_input.elements=${inputShorts.size}\nencoder_input.shape=1x80x3000\n")
@@ -432,12 +454,14 @@ object QnnWhisperRealAudioRunner {
                 appendLine("channels: mono")
                 appendLine("pcm_samples: $pcmSamples")
                 appendLine("features: [1,80,3000] FP32")
-                appendLine("feature_min: ${featureStats.min}")
-                appendLine("feature_max: ${featureStats.max}")
-                appendLine("feature_mean: ${featureStats.mean}")
-                appendLine("feature_finite: ${featureStats.finite}")
-                appendLine("feature_nan: ${featureStats.nan}")
-                appendLine("feature_inf: ${featureStats.inf}")
+                if (featureStats != null) {
+                    appendLine("feature_min: ${featureStats.min}")
+                    appendLine("feature_max: ${featureStats.max}")
+                    appendLine("feature_mean: ${featureStats.mean}")
+                    appendLine("feature_finite: ${featureStats.finite}")
+                    appendLine("feature_nan: ${featureStats.nan}")
+                    appendLine("feature_inf: ${featureStats.inf}")
+                }
                 appendLine("encoder_input_adapter: FP32->FP16")
                 appendLine("encoder: HTP SUCCESS")
                 appendLine("decoder: HTP SUCCESS")

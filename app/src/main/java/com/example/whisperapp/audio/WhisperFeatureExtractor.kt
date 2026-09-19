@@ -95,6 +95,28 @@ class WhisperFeatureExtractor {
     }
 
     fun extract(pcm16: ShortArray, sampleRate: Int): WhisperFeatures {
+        val mel = computeMel(pcm16, sampleRate)
+        var maxLog = Float.NEGATIVE_INFINITY
+        for (i in mel.indices) { mel[i] = log10(mel[i]); maxLog = max(maxLog, mel[i]) }
+        val floor = maxLog - 8f
+        for (i in mel.indices) mel[i] = (max(mel[i], floor) + 4f) / 4f
+        require(mel.all { it.isFinite() }) { "Whisper features contain NaN/Inf" }
+        require(mel.any { it != 0f }) { "Whisper features are all zero" }
+        return WhisperFeatures(mel)
+    }
+
+    /** Same pipeline as [extract] but returns FP16 samples ready for the encoder input. */
+    fun extractHalf(pcm16: ShortArray, sampleRate: Int): ShortArray {
+        val mel = computeMel(pcm16, sampleRate)
+        var maxLog = Float.NEGATIVE_INFINITY
+        for (i in mel.indices) { mel[i] = log10(mel[i]); maxLog = max(maxLog, mel[i]) }
+        val floor = maxLog - 8f
+        val out = ShortArray(mel.size)
+        for (i in mel.indices) out[i] = floatToHalf((max(mel[i], floor) + 4f) / 4f)
+        return out
+    }
+
+    private fun computeMel(pcm16: ShortArray, sampleRate: Int): FloatArray {
         require(sampleRate == SAMPLE_RATE) { "Whisper expects 16000 Hz, got $sampleRate" }
         val waveform = FloatArray(CHUNK_SAMPLES)
         val copy = min(pcm16.size, waveform.size)
@@ -127,14 +149,28 @@ class WhisperFeatureExtractor {
             }
         }
         for (i in mel.indices) if (mel[i] < 1e-10f) mel[i] = 1e-10f
-
-        var maxLog = Float.NEGATIVE_INFINITY
-        for (i in mel.indices) { mel[i] = log10(mel[i]); maxLog = max(maxLog, mel[i]) }
-        val floor = maxLog - 8f
-        for (i in mel.indices) mel[i] = (max(mel[i], floor) + 4f) / 4f
         require(mel.all { it.isFinite() }) { "Whisper features contain NaN/Inf" }
         require(mel.any { it != 0f }) { "Whisper features are all zero" }
-        return WhisperFeatures(mel)
+        return mel
+    }
+
+    /** Float -> IEEE-754 binary16 with round-to-nearest-even, matching the runner's converter. */
+    private fun floatToHalf(value: Float): Short {
+        val bits = value.toRawBits()
+        val sign = (bits ushr 16) and 0x8000
+        val exponent = ((bits ushr 23) and 0xff) - 127 + 15
+        val mantissa = bits and 0x7fffff
+        return when {
+            exponent <= 0 -> if (exponent < -10) sign.toShort() else (sign or ((mantissa or 0x800000) shr (1 - exponent + 13))).toShort()
+            exponent >= 31 -> (sign or 0x7c00 or if (mantissa == 0) 0 else 0x0200).toShort()
+            else -> {
+                var halfExponent = exponent
+                var halfMantissa = (mantissa + 0x1000) shr 13
+                if (halfMantissa == 0x400) { halfMantissa = 0; halfExponent++ }
+                if (halfExponent >= 31) (sign or 0x7c00).toShort()
+                else (sign or (halfExponent shl 10) or halfMantissa).toShort()
+            }
+        }
     }
 
     private fun buildMelFilters(): Array<FloatArray> {
