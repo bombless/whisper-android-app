@@ -34,12 +34,12 @@ object LongAudioSingleContextRunner {
         context: Context,
         pcm16: ShortArray,
         sampleRate: Int,
-        requestedSteps: Int = 12,
+        requestedSteps: Int = 128,
     ): Result {
         require(sampleRate == WhisperFeatureExtractor.SAMPLE_RATE) {
             "Whisper expects 16000 Hz, got $sampleRate"
         }
-        require(requestedSteps in 1..32) { "requestedSteps must be in 1..32" }
+        require(requestedSteps in 1..195) { "requestedSteps must be in 1..195" }
 
         val chunks = LongAudioChunker.split(pcm16, sampleRate)
         LongAudioAppLogger.info("LONG_AUDIO_START totalSamples=${pcm16.size} chunks=${chunks.size}")

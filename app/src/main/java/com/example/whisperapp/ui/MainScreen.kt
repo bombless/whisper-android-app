@@ -229,7 +229,7 @@ fun MainScreen() {
                         Log.i("WHISPER_DIAG", "UPDATE_READY cumulativeSamples=" + totalSamples + " melCached=true")
                         withContext(Dispatchers.Main) { processing = true; status = "正在转录…" }
                         Log.i("WHISPER_DIAG", "TRANSCRIBE_START cumulativeSamples=" + audioForWhisper.size + " rate=" + rate)
-                        Log.i("WHISPER_DEBUG", "TRANSCRIBE_START #$currentUpdateId audioSamples=${audioForWhisper.size} cachedMel=true melSize=${melHalf.size} requestedSteps=12 autoregressive=true")
+                        Log.i("WHISPER_DEBUG", "TRANSCRIBE_START #$currentUpdateId audioSamples=${audioForWhisper.size} cachedMel=true melSize=${melHalf.size} requestedSteps=128 autoregressive=true")
                         val transcribeStartNs = System.nanoTime()
                         var totalTranscribeMs = 0.0
                         val text = runCatching {
@@ -237,7 +237,7 @@ fun MainScreen() {
                                 context = context,
                                 pcm16 = audioForWhisper,
                                 sampleRate = rate,
-                                requestedSteps = 32,
+                                requestedSteps = 128,
                                 autoregressive = true,
                                 precomputedMelHalf = melHalf,
                                 debugUpdateId = currentUpdateId,

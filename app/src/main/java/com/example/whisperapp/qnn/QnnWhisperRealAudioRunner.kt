@@ -31,7 +31,7 @@ object QnnWhisperRealAudioRunner {
     private const val TRANSCRIBE_TOKEN = 50359
     private const val NO_TIMESTAMPS_TOKEN = 50363
     private const val MAX_STEPS = 16
-    private const val MAX_GENERATION_STEPS = 32
+    private const val MAX_GENERATION_STEPS = 195
     // Whisper language token: <|zh|>; the previous prompt forced English.
     private val forcedPrompt = intArrayOf(START_OF_TRANSCRIPT_TOKEN, ZH_LANGUAGE_TOKEN, TRANSCRIBE_TOKEN, NO_TIMESTAMPS_TOKEN)
     private val crossNames = (0 until 4).flatMap { listOf("k_cache_cross_$it", "v_cache_cross_$it") }
