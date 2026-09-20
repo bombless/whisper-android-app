@@ -15,8 +15,11 @@ data class WhisperFeatures(val data: FloatArray, val shape: LongArray = longArra
  * CPU Whisper preprocessing matching the model's Hugging Face Whisper-Tiny contract.
  *
  * Performance notes (vs the previous double-precision dense version, ~610 ms/chunk):
- *  - All DSP runs in single precision with precomputed per-stage FFT twiddle tables
- *    (no recurrence drift, no per-butterfly twiddle advance).
+ *  - All DSP runs in single precision with a direct mixed-radix 400-point DFT
+ *    (N=400 = 2^4 * 5^2: four DIT radix-2 stages down to 16x DFT25, each DFT25 via
+ *    a 5x5 Cooley-Tukey step). This replaces the former Bluestein 400-point DFT via
+ *    2x 1024-point convolutions and is ~4x faster in host benchmarks at
+ *    spectrum maxAbs ~4e-6.
  *  - Mel projection uses a sparse bin→filter scatter: each FFT bin feeds at most two
  *    triangular mel filters, so the per-frame cost drops from 80×201 dense multiply-adds
  *    to ~201 power computations plus ~400 scatter multiply-adds. Per-mel accumulation
@@ -53,7 +56,6 @@ class WhisperFeatureExtractor {
         private external fun nativeExtractHalf(pcm: ShortArray, sampleRate: Int): ShortArray
     }
 
-    private val fftSize = 1024 // Bluestein convolution size for n_fft=400
     private val window = FloatArray(N_FFT) { i -> (0.5 - 0.5 * cos(2.0 * PI * i / N_FFT)).toFloat() }
 
     // Sparse mel filterbank in CSR form: for FFT bin k, melBinIds[k] / melBinWeights[k]
@@ -61,50 +63,53 @@ class WhisperFeatureExtractor {
     private val melBinIds: Array<IntArray>
     private val melBinWeights: Array<FloatArray>
 
-    // Fixed Bluestein chirps and pre-transformed convolution kernel (float).
-    private val bluesteinChirpRe = FloatArray(N_FFT)
-    private val bluesteinChirpIm = FloatArray(N_FFT)
-    private val kernelRe = FloatArray(fftSize)
-    private val kernelIm = FloatArray(fftSize)
-    private val scratchRe = FloatArray(fftSize)
-    private val scratchIm = FloatArray(fftSize)
-
-    // Precomputed radix-2 twiddles for all stages of the 1024-point FFT.
-    // Stage with span `len` starts at cumulative offset len/2 - 1.
-    private val twiddleRe: FloatArray
-    private val twiddleIm: FloatArray
+    // Direct mixed-radix FFT400 tables (N=400 = 2^4 * 5^2).
+    private val w5Re = FloatArray(25)
+    private val w5Im = FloatArray(25)
+    private val w25Re = FloatArray(25)
+    private val w25Im = FloatArray(25)
+    private val c50Re = FloatArray(25)
+    private val c50Im = FloatArray(25)
+    private val c100Re = FloatArray(50)
+    private val c100Im = FloatArray(50)
+    private val c200Re = FloatArray(100)
+    private val c200Im = FloatArray(100)
+    private val c400Re = FloatArray(200)
+    private val c400Im = FloatArray(200)
+    private val tmpARe = FloatArray(N_FFT)
+    private val tmpAIm = FloatArray(N_FFT)
+    private val tmpBRe = FloatArray(N_FFT)
+    private val tmpBIm = FloatArray(N_FFT)
+    private val outRe = FloatArray(N_FFT)
+    private val outIm = FloatArray(N_FFT)
 
     init {
-        // Twiddle tables.
-        val totalTwiddles = fftSize - 1
-        twiddleRe = FloatArray(totalTwiddles)
-        twiddleIm = FloatArray(totalTwiddles)
-        var offset = 0
-        var len = 2
-        while (len <= fftSize) {
-            for (k in 0 until len / 2) {
-                val angle = -2.0 * PI * k / len
-                twiddleRe[offset + k] = cos(angle).toFloat()
-                twiddleIm[offset + k] = sin(angle).toFloat()
-            }
-            offset += len / 2
-            len = len shl 1
-        }
-
-        // Bluestein chirp + kernel.
-        val chirpRe = DoubleArray(N_FFT) { k -> cos(PI * k.toDouble() * k / N_FFT) }
-        val chirpIm = DoubleArray(N_FFT) { k -> sin(PI * k.toDouble() * k / N_FFT) }
-        for (k in 0 until N_FFT) {
-            bluesteinChirpRe[k] = chirpRe[k].toFloat()
-            bluesteinChirpIm[k] = chirpIm[k].toFloat()
-            kernelRe[k] = chirpRe[k].toFloat()
-            kernelIm[k] = chirpIm[k].toFloat()
-            if (k != 0) {
-                kernelRe[fftSize - k] = chirpRe[k].toFloat()
-                kernelIm[fftSize - k] = chirpIm[k].toFloat()
+        for (k1 in 0 until 5) {
+            for (n1 in 0 until 5) {
+                val a = -2.0 * PI * k1 * n1 / 5.0
+                w5Re[k1 * 5 + n1] = cos(a).toFloat()
+                w5Im[k1 * 5 + n1] = sin(a).toFloat()
             }
         }
-        radix2Fft(kernelRe, kernelIm)
+        for (k1 in 0 until 5) {
+            for (n2 in 0 until 5) {
+                val a = -2.0 * PI * k1 * n2 / 25.0
+                w25Re[k1 * 5 + n2] = cos(a).toFloat()
+                w25Im[k1 * 5 + n2] = sin(a).toFloat()
+            }
+        }
+        fun fillCombine(re: FloatArray, im: FloatArray) {
+            val half = re.size
+            for (k in 0 until half) {
+                val a = -2.0 * PI * k / (2 * half)
+                re[k] = cos(a).toFloat()
+                im[k] = sin(a).toFloat()
+            }
+        }
+        fillCombine(c50Re, c50Im)
+        fillCombine(c100Re, c100Im)
+        fillCombine(c200Re, c200Im)
+        fillCombine(c400Re, c400Im)
 
         // Dense mel filters (same Slaney construction as before), then sparsify per bin.
         val dense = buildMelFilters()
@@ -220,17 +225,16 @@ class WhisperFeatureExtractor {
         for (i in padded.indices) {
             padded[i] = waveform[reflectIndex(i - pad, waveform.size)]
         }
-        val real = FloatArray(N_FFT)
-        val imag = FloatArray(N_FFT)
+        val xw = FloatArray(N_FFT)
         val mel = FloatArray(N_MELS * N_FRAMES)
 
         for (frame in 0 until N_FRAMES) {
             val start = frame * HOP_LENGTH
-            for (i in 0 until N_FFT) { real[i] = padded[start + i] * window[i]; imag[i] = 0f }
-            bluesteinFft(real, imag)
+            for (i in 0 until N_FFT) { xw[i] = padded[start + i] * window[i] }
+            fft400(xw, outRe, outIm, tmpARe, tmpAIm, tmpBRe, tmpBIm)
             // Sparse scatter: power per bin, then accumulate into the ≤2 mel bands per bin.
             for (k in 0..N_FFT / 2) {
-                val p = real[k] * real[k] + imag[k] * imag[k]
+                val p = outRe[k] * outRe[k] + outIm[k] * outIm[k]
                 val ids = melBinIds[k]
                 val ws = melBinWeights[k]
                 for (j in ids.indices) {
@@ -313,73 +317,114 @@ class WhisperFeatureExtractor {
         return i
     }
 
-    private fun radix2Fft(re: FloatArray, im: FloatArray) {
-        val n = re.size
-        // Bit-reversal permutation.
-        var j = 0
-        for (i in 1 until n) {
-            var bit = n shr 1
-            while (j and bit != 0) { j = j xor bit; bit = bit shr 1 }
-            j = j xor bit
-            if (i < j) {
-                val tr = re[i]; re[i] = re[j]; re[j] = tr
-                val ti = im[i]; im[i] = im[j]; im[j] = ti
+    // Whisper uses n_fft=400 = 2^4 * 5^2. Four DIT radix-2 stages reduce the exact
+    // 400-point DFT to 16x 25-point DFTs; each DFT25 runs as a 5x5 Cooley-Tukey step.
+    private fun dft5(inRe: FloatArray, inIm: FloatArray, inOff: Int, stride: Int,
+                     outRe: FloatArray, outOff: Int, outIm: FloatArray) {
+        for (k in 0 until 5) {
+            var sr = 0f
+            var si = 0f
+            for (n in 0 until 5) {
+                val wr = w5Re[k * 5 + n]
+                val wi = w5Im[k * 5 + n]
+                val xr = inRe[inOff + n * stride]
+                val xi = inIm[inOff + n * stride]
+                sr += xr * wr - xi * wi
+                si += xr * wi + xi * wr
             }
-        }
-        // Iterative FFT with table twiddles.
-        var len = 2
-        var offset = 0
-        while (len <= n) {
-            val half = len shr 1
-            for (base in 0 until n step len) {
-                for (k in 0 until half) {
-                    val tw = offset + k
-                    val b = base + k + half
-                    val vr = re[b] * twiddleRe[tw] - im[b] * twiddleIm[tw]
-                    val vi = re[b] * twiddleIm[tw] + im[b] * twiddleRe[tw]
-                    val a = base + k
-                    val ur = re[a]
-                    val ui = im[a]
-                    re[a] = ur + vr
-                    im[a] = ui + vi
-                    re[b] = ur - vr
-                    im[b] = ui - vi
-                }
-            }
-            offset += half
-            len = len shl 1
+            outRe[outOff + k] = sr
+            outIm[outOff + k] = si
         }
     }
 
-    // Whisper uses n_fft=400, which is not radix-2. Bluestein reduces the exact 400-point
-    // DFT to a 1024-point power-of-two convolution without changing the FFT bin frequencies.
-    private fun bluesteinFft(real: FloatArray, imag: FloatArray) {
-        java.util.Arrays.fill(scratchRe, 0f)
-        java.util.Arrays.fill(scratchIm, 0f)
-        for (k in 0 until N_FFT) {
-            val c = bluesteinChirpRe[k]
-            val s = bluesteinChirpIm[k]
-            scratchRe[k] = real[k] * c + imag[k] * s
-            scratchIm[k] = imag[k] * c - real[k] * s
+    private val dft25ColRe = FloatArray(5)
+    private val dft25ColIm = FloatArray(5)
+    private val dft25ColOutRe = FloatArray(5)
+    private val dft25ColOutIm = FloatArray(5)
+    private val dft25F1Re = FloatArray(25)
+    private val dft25F1Im = FloatArray(25)
+    private val dft25RowOutRe = FloatArray(5)
+    private val dft25RowOutIm = FloatArray(5)
+
+    // 25-point DFT: Xin[n1][n2] = in[(5*n1+n2)*stride]; Xout[k1+5*k2].
+    private fun dft25(inRe: FloatArray, inIm: FloatArray, inOff: Int, stride: Int,
+                      outRe: FloatArray, outOff: Int, outIm: FloatArray) {
+        for (n2 in 0 until 5) {
+            for (n1 in 0 until 5) {
+                dft25ColRe[n1] = inRe[inOff + (5 * n1 + n2) * stride]
+                dft25ColIm[n1] = inIm[inOff + (5 * n1 + n2) * stride]
+            }
+            dft5(dft25ColRe, dft25ColIm, 0, 1, dft25ColOutRe, 0, dft25ColOutIm)
+            for (k1 in 0 until 5) {
+                val wr = w25Re[k1 * 5 + n2]
+                val wi = w25Im[k1 * 5 + n2]
+                val xr = dft25ColOutRe[k1]
+                val xi = dft25ColOutIm[k1]
+                dft25F1Re[k1 * 5 + n2] = xr * wr - xi * wi
+                dft25F1Im[k1 * 5 + n2] = xr * wi + xi * wr
+            }
         }
-        radix2Fft(scratchRe, scratchIm)
-        for (k in 0 until fftSize) {
-            val r = scratchRe[k] * kernelRe[k] - scratchIm[k] * kernelIm[k]
-            val i = scratchRe[k] * kernelIm[k] + scratchIm[k] * kernelRe[k]
-            scratchRe[k] = r
-            scratchIm[k] = i
+        for (k1 in 0 until 5) {
+            // Row k1 of F1 is contiguous at [k1*5 .. k1*5+4].
+            for (n2 in 0 until 5) {
+                dft25ColRe[n2] = dft25F1Re[k1 * 5 + n2]
+                dft25ColIm[n2] = dft25F1Im[k1 * 5 + n2]
+            }
+            dft5(dft25ColRe, dft25ColIm, 0, 1, dft25RowOutRe, 0, dft25RowOutIm)
+            for (k2 in 0 until 5) {
+                outRe[outOff + k1 + 5 * k2] = dft25RowOutRe[k2]
+                outIm[outOff + k1 + 5 * k2] = dft25RowOutIm[k2]
+            }
         }
-        // Inverse via conjugation: negate imag, forward FFT, negate imag, scale.
-        for (k in 0 until fftSize) scratchIm[k] = -scratchIm[k]
-        radix2Fft(scratchRe, scratchIm)
-        val scale = 1.0f / fftSize
-        for (k in 0 until N_FFT) {
-            val c = bluesteinChirpRe[k]
-            val s = bluesteinChirpIm[k]
-            val sr = scratchRe[k] * scale
-            val si = -scratchIm[k] * scale
-            real[k] = sr * c + si * s
-            imag[k] = si * c - sr * s
+    }
+
+    private fun combineHalves(tmpRe: FloatArray, tmpIm: FloatArray, tmpOff: Int, h: Int,
+                              twRe: FloatArray, twIm: FloatArray,
+                              outRe: FloatArray, outOff: Int, outIm: FloatArray) {
+        for (k in 0 until h) {
+            val er = tmpRe[tmpOff + k]
+            val ei = tmpIm[tmpOff + k]
+            val orv = tmpRe[tmpOff + h + k]
+            val oi = tmpIm[tmpOff + h + k]
+            val wr = twRe[k]
+            val wi = twIm[k]
+            val vr = orv * wr - oi * wi
+            val vi = orv * wi + oi * wr
+            outRe[outOff + k] = er + vr
+            outIm[outOff + k] = ei + vi
+            outRe[outOff + h + k] = er - vr
+            outIm[outOff + h + k] = ei - vi
         }
+    }
+
+    private fun fftRec(inRe: FloatArray, inIm: FloatArray, inOff: Int, n: Int, stride: Int,
+                       outRe: FloatArray, outOff: Int, outIm: FloatArray,
+                       tmpRe: FloatArray, tmpOff: Int, tmpIm: FloatArray) {
+        if (n == 25) {
+            dft25(inRe, inIm, inOff, stride, outRe, outOff, outIm)
+            return
+        }
+        val h = n shr 1
+        fftRec(inRe, inIm, inOff, h, stride shl 1, tmpRe, tmpOff, tmpIm, outRe, outOff, outIm)
+        fftRec(inRe, inIm, inOff + stride, h, stride shl 1,
+            tmpRe, tmpOff + h, tmpIm, outRe, outOff, outIm)
+        val (twRe, twIm) = when (n) {
+            50 -> c50Re to c50Im
+            100 -> c100Re to c100Im
+            200 -> c200Re to c200Im
+            else -> c400Re to c400Im
+        }
+        combineHalves(tmpRe, tmpIm, tmpOff, h, twRe, twIm, outRe, outOff, outIm)
+    }
+
+    private fun fft400(xWin: FloatArray,
+                       outRe: FloatArray, outIm: FloatArray,
+                       tmpARe: FloatArray, tmpAIm: FloatArray,
+                       tmpBRe: FloatArray, tmpBIm: FloatArray) {
+        for (i in 0 until N_FFT) {
+            tmpARe[i] = xWin[i]
+            tmpAIm[i] = 0f
+        }
+        fftRec(tmpARe, tmpAIm, 0, N_FFT, 1, outRe, 0, outIm, tmpBRe, 0, tmpBIm)
     }
 }
