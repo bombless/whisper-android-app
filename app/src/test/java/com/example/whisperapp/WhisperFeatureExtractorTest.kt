@@ -2,6 +2,7 @@ package com.example.whisperapp
 
 import com.example.whisperapp.audio.WhisperFeatureExtractor
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import kotlin.math.PI
@@ -224,5 +225,21 @@ class WhisperFeatureExtractorTest {
         val t0 = System.nanoTime()
         block()
         return (System.nanoTime() - t0) / 1_000_000.0
+    }
+
+    @Test
+    fun incrementalCacheMatchesFullJavaExtractionForGrowingAudio() {
+        val extractor = WhisperFeatureExtractor()
+        val cache = extractor.newIncrementalCache()
+        val first = ShortArray(16_000) { ((it * 17) % 32767).toShort() }
+        val second = ShortArray(16_000) { (((it + 31_000) * 13) % 32767).toShort() }
+        val third = ShortArray(16_000) { (((it + 62_000) * 19) % 32767).toShort() }
+
+        cache.append(first, WhisperFeatureExtractor.SAMPLE_RATE)
+        cache.append(second, WhisperFeatureExtractor.SAMPLE_RATE)
+        val incremental3s = cache.append(third, WhisperFeatureExtractor.SAMPLE_RATE)
+        val full3s = extractor.extractHalf(first + second + third, WhisperFeatureExtractor.SAMPLE_RATE)
+
+        assertArrayEquals(full3s, incremental3s)
     }
 }

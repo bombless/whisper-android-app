@@ -26,6 +26,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.example.whisperapp.audio.AudioPlayer
+import com.example.whisperapp.audio.WhisperFeatureExtractor
 import com.example.whisperapp.qnn.QnnWhisperRealAudioRunner
 import com.example.whisperapp.tts.ChineseTextProcessor
 import com.example.whisperapp.tts.SherpaOnnxTtsEngine
@@ -56,6 +57,7 @@ fun MainScreen() {
     var recordingJob by remember { mutableStateOf<Job?>(null) }
     val recordingLifecycleMutex = remember { Mutex() }
     var previousWhisperText by remember { mutableStateOf("") }
+    val whisperMelCache = remember { WhisperFeatureExtractor().newIncrementalCache() }
     val audioPlayer = remember { AudioPlayer() }
     fun createTtsQueue(variant: SherpaOnnxTtsEngine.Variant): TtsQueue = TtsQueue(scope, SherpaOnnxTtsEngine(context, variant), audioPlayer) { error ->
         Log.e("WHISPER_TTS", "TTS failed variant=$variant: ${error.message}", error)
@@ -158,6 +160,7 @@ fun MainScreen() {
         recordingJob?.cancel()
         processing = false
         previousWhisperText = ""
+        whisperMelCache.reset()
         ttsQueue?.clearAndStop()
         status = "已停止"
     }
@@ -166,58 +169,103 @@ fun MainScreen() {
         Log.i("WHISPER_DIAG", "RECORD_START")
         transcript.clear()
         previousWhisperText = ""
+        whisperMelCache.reset()
         ttsQueue?.clearAndStop()
         recording = true
         status = "正在监听…"
         recordingJob = scope.launch(Dispatchers.IO) {
             recordingLifecycleMutex.withLock {
             val rate = 16_000
-            val samplesPerChunk = rate * 5
+            val samplesPerUpdate = rate
+            val maxContextSamples = WhisperFeatureExtractor.CHUNK_SAMPLES
             val minBuffer = AudioRecord.getMinBufferSize(rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
             if (minBuffer <= 0) {
                 withContext(Dispatchers.Main) { recording = false; status = "麦克风不可用" }
                 return@launch
             }
             var recorder: AudioRecord? = null
-            val chunk = ShortArray(samplesPerChunk)
-            var offset = 0
+            val updateBuffer = ShortArray(samplesPerUpdate)
+            val fullAudio = ShortArray(maxContextSamples)
+            var updateOffset = 0
+            var totalSamples = 0
+            var updateId = 0
+            var lastUpdateCompletedNs = 0L
             try {
                 QnnWhisperRealAudioRunner.start(context)
-                recorder = AudioRecord(MediaRecorder.AudioSource.MIC, rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, maxOf(minBuffer, samplesPerChunk))
+                recorder = AudioRecord(MediaRecorder.AudioSource.MIC, rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, maxOf(minBuffer, samplesPerUpdate))
                 check(recorder?.state == AudioRecord.STATE_INITIALIZED) { "麦克风初始化失败" }
                 val activeRecorder = recorder ?: error("麦克风录音器未初始化")
                 Log.i("WHISPER_DIAG", "QNN_SESSION_READY")
                 activeRecorder.startRecording()
                 check(activeRecorder.recordingState == AudioRecord.RECORDSTATE_RECORDING) { "麦克风未进入录音状态" }
-                Log.i("WHISPER_DIAG", "AUDIO_RECORD_STARTED state=${activeRecorder.recordingState} minBuffer=$minBuffer chunkSamples=$samplesPerChunk")
+                Log.i("WHISPER_DIAG", "AUDIO_RECORD_STARTED state=" + activeRecorder.recordingState + " minBuffer=" + minBuffer + " updateSamples=" + samplesPerUpdate)
                 while (kotlinx.coroutines.currentCoroutineContext().isActive) {
-                    val n = activeRecorder.read(chunk, offset, samplesPerChunk - offset)
+                    val requestedRead = samplesPerUpdate - updateOffset
+                    val n = activeRecorder.read(updateBuffer, updateOffset, requestedRead)
                     if (n <= 0) {
-                        Log.w("WHISPER_DIAG", "AUDIO_READ_ERROR n=$n offset=$offset state=${recorder.recordingState}")
+                        Log.w("WHISPER_DIAG", "AUDIO_READ_ERROR n=" + n + " offset=" + updateOffset + " state=" + recorder.recordingState)
+                        Log.w("WHISPER_DEBUG", "AUDIO_READ_ERROR requestedSamples=$requestedRead actualSamples=$n cumulativeSamples=${totalSamples + updateOffset}")
                         continue
                     }
-                    offset += n
-                    if (offset == samplesPerChunk) {
-                        offset = 0
-                        Log.i("WHISPER_DIAG", "CHUNK_READY samples=$samplesPerChunk rms=${kotlin.math.sqrt(chunk.map { it.toDouble() * it }.average())}")
+                    updateOffset += n
+                    Log.i("WHISPER_DEBUG", "AUDIO readRequested=$requestedRead readActual=$n cumulative=${totalSamples + updateOffset} audioSec=${(totalSamples + updateOffset) / rate.toDouble()}")
+                    if (updateOffset == samplesPerUpdate) {
+                        updateOffset = 0
+                        updateId++
+                        val currentUpdateId = updateId
+                        val copyCount = minOf(samplesPerUpdate, maxContextSamples - totalSamples)
+                        if (copyCount > 0) {
+                            updateBuffer.copyInto(fullAudio, totalSamples, 0, copyCount)
+                            totalSamples += copyCount
+                        }
+                        if (totalSamples == 0) continue
+                        val audioForWhisper = fullAudio.copyOf(totalSamples)
+                        val audioIntervalMs = if (lastUpdateCompletedNs == 0L) 0.0 else (System.nanoTime() - lastUpdateCompletedNs) / 1_000_000.0
+                        Log.i("WHISPER_DEBUG", "UPDATE #$currentUpdateId samples=$samplesPerUpdate cumulativeSamples=$totalSamples audioSec=${totalSamples / rate.toDouble()} audioIntervalMs=$audioIntervalMs")
+                        val melStartNs = System.nanoTime()
+                        val melHalf = whisperMelCache.append(updateBuffer, rate)
+                        val melMs = (System.nanoTime() - melStartNs) / 1_000_000.0
+                        Log.i("WHISPER_DEBUG", "MEL #$currentUpdateId appendSamples=$samplesPerUpdate cached=true frameRange=incremental elements=${melHalf.size} melMs=$melMs")
+                        Log.i("WHISPER_DIAG", "UPDATE_READY cumulativeSamples=" + totalSamples + " melCached=true")
                         withContext(Dispatchers.Main) { processing = true; status = "正在转录…" }
-                        Log.i("WHISPER_DIAG", "TRANSCRIBE_START samples=${chunk.size} rate=$rate threads=2")
+                        Log.i("WHISPER_DIAG", "TRANSCRIBE_START cumulativeSamples=" + audioForWhisper.size + " rate=" + rate)
+                        Log.i("WHISPER_DEBUG", "TRANSCRIBE_START #$currentUpdateId audioSamples=${audioForWhisper.size} cachedMel=true melSize=${melHalf.size} requestedSteps=12 autoregressive=true")
+                        val transcribeStartNs = System.nanoTime()
+                        var totalTranscribeMs = 0.0
                         val text = runCatching {
-                            QnnWhisperRealAudioRunner.transcribeChunk(context, chunk.copyOf(), rate, requestedSteps = 12, autoregressive = true).also { result -> check(result.passed) { result.report } }.text.trim()
+                            QnnWhisperRealAudioRunner.transcribeChunk(
+                                context = context,
+                                pcm16 = audioForWhisper,
+                                sampleRate = rate,
+                                requestedSteps = 32,
+                                autoregressive = true,
+                                precomputedMelHalf = melHalf,
+                                debugUpdateId = currentUpdateId,
+                            ).also { result -> check(result.passed) { result.report } }.text.trim()
                         }.onSuccess {
-                            Log.i("WHISPER_DIAG", "NATIVE_RESULT chars=${it.length} text=${it.take(160)}")
+                            totalTranscribeMs = (System.nanoTime() - transcribeStartNs) / 1_000_000.0
+                            Log.i("WHISPER_DEBUG", "TRANSCRIBE_DONE #$currentUpdateId elapsedMs=$totalTranscribeMs")
+                            Log.i("WHISPER_DEBUG", "RESULT #$currentUpdateId text=\"${if (it.isBlank()) "<EMPTY>" else it.take(160)}\"")
+                            Log.i("WHISPER_DIAG", "NATIVE_RESULT chars=" + it.length + " text=" + it.take(160))
                         }.onFailure {
-                            Log.e("WHISPER_DIAG", "NATIVE_ERROR type=${it::class.java.name} message=${it.message}", it)
-                        }.getOrElse { "转录失败：${it.message ?: it::class.java.simpleName}" }
+                            totalTranscribeMs = (System.nanoTime() - transcribeStartNs) / 1_000_000.0
+                            Log.e("WHISPER_DEBUG", "TRANSCRIBE_ERROR #$currentUpdateId elapsedMs=$totalTranscribeMs type=${it::class.java.name} message=${it.message}", it)
+                            Log.e("WHISPER_DEBUG", "RESULT #$currentUpdateId text=<EMPTY> error=true")
+                            Log.e("WHISPER_DIAG", "NATIVE_ERROR type=" + it::class.java.name + " message=" + it.message, it)
+                        }.getOrElse { "转录失败：" + (it.message ?: it::class.java.simpleName) }
+                        lastUpdateCompletedNs = System.nanoTime()
                         withContext(Dispatchers.Main) {
                             val normalized = ChineseTextProcessor.normalizeChineseText(text)
-                            Log.i("WHISPER_DIAG", "UI_UPDATE rawChars=${text.length} normalizedChars=${normalized.length} blank=${normalized.isBlank()}")
+                            Log.i("WHISPER_DIAG", "UI_UPDATE rawChars=" + text.length + " normalizedChars=" + normalized.length + " blank=" + normalized.isBlank())
                             if (normalized.isNotBlank()) {
-                                transcript.add(normalized)
+                                transcript.clear()
+                                transcript.add("${normalized}【${totalTranscribeMs.toInt()}ms】")
                                 previousWhisperText = normalized
                             }
                             processing = false
-                            status = if (recording) "正在监听…" else "已停止"
+                            status = if (recording) {
+                                if (totalSamples >= maxContextSamples) "正在监听…（已到 30 秒 Whisper 上下文）" else "正在监听…"
+                            } else "已停止"
                         }
                     }
                 }

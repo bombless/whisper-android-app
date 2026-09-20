@@ -80,6 +80,7 @@ class WhisperFeatureExtractor {
     private val tmpAIm = FloatArray(N_FFT)
     private val tmpBRe = FloatArray(N_FFT)
     private val tmpBIm = FloatArray(N_FFT)
+    private val incrementalWindow = FloatArray(N_FFT)
     private val outRe = FloatArray(N_FFT)
     private val outIm = FloatArray(N_FFT)
 
@@ -146,6 +147,85 @@ class WhisperFeatureExtractor {
         for (i in mel.indices) result[i] = floatToHalf(mel[i])
         return result
     }
+
+    /**
+     * Incremental feature cache for live transcription. Only FFT/mel frames
+     * touched by newly appended PCM are recomputed; normalization is a cheap
+     * linear pass over the cached 80x3000 raw-mel matrix.
+     */
+    inner class IncrementalCache {
+        private val pcm = ShortArray(CHUNK_SAMPLES)
+        private val rawMel = FloatArray(N_MELS * N_FRAMES) { 1e-10f }
+        private var sampleCount = 0
+
+        fun append(samples: ShortArray, sampleRate: Int): ShortArray {
+            require(sampleRate == SAMPLE_RATE) { "Whisper expects 16000 Hz, got $sampleRate" }
+            val oldCount = sampleCount
+            val copy = min(samples.size, CHUNK_SAMPLES - oldCount)
+            if (copy > 0) samples.copyInto(pcm, oldCount, 0, copy)
+            sampleCount = min(CHUNK_SAMPLES, oldCount + samples.size)
+            if (sampleCount > oldCount) recomputeAffectedFrames(oldCount, sampleCount)
+
+            var minFrame = N_FRAMES
+            var maxFrame = -1
+            if (sampleCount > oldCount) {
+                val centerPad = N_FFT / 2
+                minFrame = max(0, oldCount - (N_FFT - centerPad - 1) + HOP_LENGTH - 1) / HOP_LENGTH
+                maxFrame = min(N_FRAMES - 1, (sampleCount - 1 + centerPad) / HOP_LENGTH)
+            }
+
+            val mel = rawMel.copyOf()
+            var maxLog = Float.NEGATIVE_INFINITY
+            for (i in mel.indices) {
+                val v = log10(max(mel[i], 1e-10f))
+                mel[i] = v
+                if (v > maxLog) maxLog = v
+            }
+            val floor = maxLog - 8f
+            val out = ShortArray(mel.size)
+            for (i in mel.indices) {
+                out[i] = floatToHalf((max(mel[i], floor) + 4f) / 4f)
+            }
+            android.util.Log.i("WHISPER_DEBUG", "CACHE old=$oldCount new=${samples.size} copied=$copy pcmTotal=$sampleCount frameRange=$minFrame..$maxFrame totalFrames=${if (maxFrame >= 0) maxFrame + 1 else 0} melChecksum=${checksum(out)}")
+            return out
+        }
+
+        fun reset() {
+            pcm.fill(0)
+            rawMel.fill(1e-10f)
+            sampleCount = 0
+        }
+
+        private fun checksum(values: ShortArray): Long {
+            var h = -375076303657289L
+            for (v in values) h = (h xor (v.toInt() and 0xffff).toLong()) * 0x100000001b3L
+            return h
+        }
+
+        private fun recomputeAffectedFrames(oldSamples: Int, newSamples: Int) {
+            val centerPad = N_FFT / 2
+            val firstFrame = max(0, oldSamples - (N_FFT - centerPad - 1) + HOP_LENGTH - 1) / HOP_LENGTH
+            val lastFrame = min(N_FRAMES - 1, (newSamples - 1 + centerPad) / HOP_LENGTH)
+            if (firstFrame > lastFrame) return
+            for (frame in firstFrame..lastFrame) {
+                for (m in 0 until N_MELS) rawMel[m * N_FRAMES + frame] = 0f
+                val start = frame * HOP_LENGTH
+                for (i in 0 until N_FFT) {
+                    val sourceIndex = reflectIndex(start + i - N_FFT / 2, CHUNK_SAMPLES)
+                    incrementalWindow[i] = pcm[sourceIndex] / 32768f * window[i]
+                }
+                fft400(incrementalWindow, outRe, outIm, tmpARe, tmpAIm, tmpBRe, tmpBIm)
+                for (k in 0..N_FFT / 2) {
+                    val p = outRe[k] * outRe[k] + outIm[k] * outIm[k]
+                    val ids = melBinIds[k]
+                    val ws = melBinWeights[k]
+                    for (j in ids.indices) rawMel[ids[j] * N_FRAMES + frame] += p * ws[j]
+                }
+            }
+        }
+    }
+
+    fun newIncrementalCache(): IncrementalCache = IncrementalCache()
 
     /**
      * Returns log-mel normalized per whisper's (log10, max-8 floor, +4 /4) contract,
