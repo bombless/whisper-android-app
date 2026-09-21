@@ -15,7 +15,14 @@ class WhisperTokenizer private constructor(
 
     fun token(id: Int): String? = idToToken[id]
 
+    /** Number of vocabulary entries, including special/added tokens. */
+    val vocabularySize: Int get() = tokenToIdMap.size
+
     fun tokenToId(token: String): Int? = tokenToIdMap[token]
+
+    /** Resolves a special token by name; variant-independent prompt/stop-token lookup. */
+    fun idFor(token: String): Int =
+        tokenToIdMap[token] ?: error("Tokenizer vocabulary missing token: $token")
 
     fun encode(text: String): IntArray {
         if (text.isEmpty()) return IntArray(0)
@@ -96,15 +103,25 @@ class WhisperTokenizer private constructor(
             return WhisperTokenizer(tokenToId, idToToken, emptyMap())
         }
 
-        fun fromAssets(assets: AssetManager, basePath: String = "models/whisper/tokenizer"): WhisperTokenizer {
+        fun fromAssets(
+            assets: AssetManager,
+            basePath: String = "models/whisper/tokenizer",
+            expectedVocabSize: Int = 51865,
+        ): WhisperTokenizer {
             return fromAssetTexts(
                 readAsset(assets, "$basePath/vocab.json"),
                 readAsset(assets, "$basePath/merges.txt"),
                 readAsset(assets, "$basePath/added_tokens.json"),
+                expectedVocabSize,
             )
         }
 
-        internal fun fromAssetTexts(vocabText: String, mergesText: String, addedTokensText: String): WhisperTokenizer {
+        internal fun fromAssetTexts(
+            vocabText: String,
+            mergesText: String,
+            addedTokensText: String,
+            expectedVocabSize: Int = 51865,
+        ): WhisperTokenizer {
             val tokenToId = LinkedHashMap<String, Int>(50258)
             tokenToId.putAll(parseStringIntObject(vocabText))
             tokenToId.putAll(parseStringIntObject(addedTokensText))
@@ -121,14 +138,18 @@ class WhisperTokenizer private constructor(
                 .toList()
             val mergeRanks = merges.withIndex().associate { it.value to it.index }
 
-            require(tokenToId.size == 51865) {
-                "Whisper-Tiny tokenizer vocabulary must contain 51865 entries, got ${tokenToId.size}"
+            require(tokenToId.size == expectedVocabSize) {
+                "Whisper tokenizer vocabulary must contain $expectedVocabSize entries, got ${tokenToId.size}"
             }
+            // Base special tokens are stable across the multilingual variants.
             require(tokenToId["<|endoftext|>"] == 50257)
             require(tokenToId["<|startoftranscript|>"] == 50258)
             require(tokenToId["<|en|>"] == 50259)
-            require(tokenToId["<|transcribe|>"] == 50359)
-            require(tokenToId["<|notimestamps|>"] == 50363)
+            require(tokenToId["<|zh|>"] == 50260)
+            // <|transcribe|>/<|notimestamps|> are NOT stable: Large-V3 inserts <|yue|>,
+            // which shifts them by one. Require presence only; callers resolve IDs by name.
+            require(tokenToId.containsKey("<|transcribe|>")) { "Tokenizer is missing <|transcribe|>" }
+            require(tokenToId.containsKey("<|notimestamps|>")) { "Tokenizer is missing <|notimestamps|>" }
 
             val idToToken = tokenToId.entries.associate { (token, id) -> id to token }
             return WhisperTokenizer(tokenToId, idToToken, mergeRanks)

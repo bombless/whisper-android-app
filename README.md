@@ -32,3 +32,17 @@ Install/verify `qai-hub-models`, then run model info for `Whisper-Tiny` and `Mel
 - QnnAsrEngine now validates the real Whisper asset contract; tokenizer boundary is present.
 - Remaining M3 work: invoke the encoder/decoder QNN context binaries with the exact QAIRT Android API, then add Whisper log-mel preprocessing, token sampling, and timestamp/language handling before connecting AudioRecord.
 
+## 2026-09-21 progress: Whisper-Large-V3-Turbo on QNN
+
+- The app now runs **Whisper-Large-V3-Turbo** on QNN/HTP. Whisper-Tiny is retained and
+  selectable through `WhisperVariant`; both share one runner because the graph topology is
+  identical and only mel bins (80/128), KV heads (6/20) and vocab (51865/51866) differ.
+- Turbo assets added: `encoder_ctx.onnx` + `decoder_ctx.onnx` EPContext wrappers generated
+  from the asset's `metadata.json`, the Large-V3 tokenizer, and an incremental cache on the
+  128-bin mel frontend for the live loop.
+- On-device results: encoder 1390.9 ms for a 30 s window, ~20 ms per decoder step, ~1.6 s per
+  1-second live update, `cpu_fallback: disabled`, `dsp_crash: false`.
+- The same WAV through Tiny and Turbo yields an identical token sequence and text, which
+  cross-validates both paths. Turbo decodes `你好呀 你会说话吗 你应该不会说话吧你说几句来听听呀`.
+- Details, contract table, evidence and known limitations: `TURBO_QNN_RESULTS.md`.
+

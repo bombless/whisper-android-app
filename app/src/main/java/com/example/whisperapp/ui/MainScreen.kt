@@ -27,6 +27,7 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.example.whisperapp.audio.AudioPlayer
 import com.example.whisperapp.audio.WhisperFeatureExtractor
+import com.example.whisperapp.asr.WhisperVariant
 import com.example.whisperapp.qnn.QnnWhisperRealAudioRunner
 import com.example.whisperapp.tts.ChineseTextProcessor
 import com.example.whisperapp.tts.SherpaOnnxTtsEngine
@@ -57,7 +58,10 @@ fun MainScreen() {
     var recordingJob by remember { mutableStateOf<Job?>(null) }
     val recordingLifecycleMutex = remember { Mutex() }
     var previousWhisperText by remember { mutableStateOf("") }
-    val whisperMelCache = remember { WhisperFeatureExtractor().newIncrementalCache() }
+    // Active STT model. Switching this rebuilds the QNN sessions on the next chunk
+    // (the runner compares the requested variant against what it has loaded).
+    val sttVariant = WhisperVariant.LARGE_V3_TURBO
+    val whisperMelCache = remember { sttVariant.newMelCache() }
     val audioPlayer = remember { AudioPlayer() }
     fun createTtsQueue(variant: SherpaOnnxTtsEngine.Variant): TtsQueue = TtsQueue(scope, SherpaOnnxTtsEngine(context, variant), audioPlayer) { error ->
         Log.e("WHISPER_TTS", "TTS failed variant=$variant: ${error.message}", error)
@@ -90,11 +94,11 @@ fun MainScreen() {
                 withContext(Dispatchers.Main) { selectedTab = target }
                 if (target == 1) {
                     status = "STT native 正在加载…"
-                    QnnWhisperRealAudioRunner.start(context)
+                    QnnWhisperRealAudioRunner.start(context, sttVariant)
                     sttReady = true
                     status = "STT 已就绪"
-                    Log.i("WHISPER_DIAG", "TAB_NATIVE_READY target=STT")
-                } else {
+                    Log.i("WHISPER_DIAG", "TAB_NATIVE_READY target=STT variant=${sttVariant.name}")
+                } else if (target == 0) {
                     ttsStatus = "TTS native 正在加载…"
                     val queue = createTtsQueue(selectedTtsVariant)
                     ttsQueue = queue
@@ -102,12 +106,14 @@ fun MainScreen() {
                     ttsReady = true
                     ttsStatus = "TTS 已就绪: ${selectedTtsVariant.displayName}"
                     Log.i("WHISPER_TTS", "TAB_NATIVE_READY target=TTS variant=$selectedTtsVariant")
+                } else {
+                    Log.i("WHISPER_CHAT", "TAB_READY target=CHAT")
                 }
             } catch (t: Throwable) {
                 Log.e("WHISPER_NATIVE", "TAB_NATIVE_LOAD_FAILED target=$target", t)
                 withContext(Dispatchers.Main) {
                     if (target == 1) status = "STT 加载失败: ${t.message ?: t::class.java.simpleName}"
-                    else ttsStatus = "TTS 加载失败: ${t.message ?: t::class.java.simpleName}"
+                    else if (target == 0) ttsStatus = "TTS 加载失败: ${t.message ?: t::class.java.simpleName}"
                 }
             } finally {
                 nativeSwitching = false
@@ -191,7 +197,7 @@ fun MainScreen() {
             var updateId = 0
             var lastUpdateCompletedNs = 0L
             try {
-                QnnWhisperRealAudioRunner.start(context)
+                QnnWhisperRealAudioRunner.start(context, sttVariant)
                 recorder = AudioRecord(MediaRecorder.AudioSource.MIC, rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, maxOf(minBuffer, samplesPerUpdate))
                 check(recorder?.state == AudioRecord.STATE_INITIALIZED) { "麦克风初始化失败" }
                 val activeRecorder = recorder ?: error("麦克风录音器未初始化")
@@ -241,6 +247,7 @@ fun MainScreen() {
                                 autoregressive = true,
                                 precomputedMelHalf = melHalf,
                                 debugUpdateId = currentUpdateId,
+                                variant = sttVariant,
                             ).also { result -> check(result.passed) { result.report } }.text.trim()
                         }.onSuccess {
                             totalTranscribeMs = (System.nanoTime() - transcribeStartNs) / 1_000_000.0
@@ -312,6 +319,7 @@ fun MainScreen() {
             TabRow(selectedTabIndex = selectedTab) {
                 Tab(selected = selectedTab == 0, onClick = { switchToTab(0) }, text = { Text("文字转语音") })
                 Tab(selected = selectedTab == 1, onClick = { switchToTab(1) }, text = { Text("语音转文字") })
+                Tab(selected = selectedTab == 2, onClick = { switchToTab(2) }, text = { Text("聊天") })
             }
             Spacer(Modifier.height(20.dp))
             Box(
@@ -364,7 +372,7 @@ fun MainScreen() {
                         shape = RoundedCornerShape(18.dp),
                     ) { Text("播放语音") }
                 }
-            } else {
+            } else if (selectedTab == 1) {
                 Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(20.dp)) {
                     Column(Modifier.fillMaxWidth()) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -398,9 +406,11 @@ fun MainScreen() {
                             colors = ButtonDefaults.buttonColors(containerColor = if (recording) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary)
                         ) { Text(if (recording) "停止转录" else "开始说话") }
                         Spacer(Modifier.height(8.dp))
-                        Text("Whisper Tiny · 16 kHz · 每 5 秒更新一次", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelMedium)
+                        Text("${sttVariant.displayName} · 16 kHz · 每 5 秒更新一次", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelMedium)
                     }
                 }
+            } else {
+                ChatScreen(Modifier.fillMaxSize())
             }
             }
         }

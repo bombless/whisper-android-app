@@ -4,7 +4,42 @@ local.properties
 **/build/
 **/.cxx/
 .idea/
+.vscode/
 *.iml
 *.apk
 *.aab
 *.log
+
+# Model payloads are not committed.
+#  - the Tiny set and the TTS models live in the `lib` submodule (lib/assets/models/...)
+#  - the Whisper-Large-V3-Turbo QNN set is ~2.2 GB, far over GitHub's 100 MB per-file
+#    limit; reconstruct it with tools/fetch_turbo_assets.py
+#  - the LFM2 chat payload is ~0.4 GB
+app/src/main/assets/models/
+app/src/main/assets/chat/
+LFM2.5-230M-ONNX/
+
+# Working directory for downloading/repairing the Turbo asset archive.
+tools/whisper_large_v3_turbo_asset/
+chat-build/
+
+# Host binaries built from tools/mel_host/host_main.cpp (keep the source, not the output).
+tools/mel_host/mel_host
+tools/mel_host/mel_host_new
+
+# Local debugging output: mel dumps, op traces, scratch build/test logs and traces.
+mel_good.bin
+mel_java.bin
+mel_native_new.bin
+melh_good.bin
+melh_java.bin
+trace_dump*.json
+decoder_trace.csv
+encoder_trace.csv
+build_log.txt
+dump_log.txt
+dump2_log.txt
+sym_log.txt
+test_log.txt
+test_run_stderr.txt
+test_run_stdout.txt

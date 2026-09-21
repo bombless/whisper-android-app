@@ -18,6 +18,13 @@ android {
         )
     }
 
+    androidResources {
+        // Keep assets stored uncompressed. The QNN runner opens each context binary with
+        // AssetManager.openFd() to learn its real length and skip re-copying multi-GB
+        // binaries into cacheDir on every chunk; openFd is only available uncompressed.
+        noCompress += listOf("")
+    }
+
     defaultConfig {
         applicationId = "com.example.whisperapp"
         minSdk = 29
@@ -53,6 +60,13 @@ android {
     }
     kotlinOptions { jvmTarget = "17" }
     buildFeatures { compose = true }
+
+    testOptions {
+        // The mel caches log progress via android.util.Log, which the stub android.jar
+        // does not implement; without this every incremental-cache unit test throws
+        // "Method i in android.util.Log not mocked".
+        unitTests.isReturnDefaultValues = true
+    }
 
     sourceSets {
         getByName("main") {

@@ -25,7 +25,7 @@ data class WhisperFeatures(val data: FloatArray, val shape: LongArray = longArra
  *    to ~201 power computations plus ~400 scatter multiply-adds. Per-mel accumulation
  *    order stays ascending in k, matching the dense summation order.
  */
-class WhisperFeatureExtractor {
+class WhisperFeatureExtractor : WhisperMelFrontend {
     companion object {
         const val SAMPLE_RATE = 16_000
         const val N_FFT = 400
@@ -122,7 +122,7 @@ class WhisperFeatureExtractor {
         }
     }
 
-    fun extract(pcm16: ShortArray, sampleRate: Int): WhisperFeatures {
+    override fun extract(pcm16: ShortArray, sampleRate: Int): WhisperFeatures {
         val mel = extractNormalizedMel(pcm16, sampleRate)
         require(mel.all { it.isFinite() }) { "Whisper features contain NaN/Inf" }
         require(mel.any { it != 0f }) { "Whisper features are all zero" }
@@ -130,7 +130,7 @@ class WhisperFeatureExtractor {
     }
 
     /** Same pipeline as [extract] but returns FP16 samples ready for the encoder input. */
-    fun extractHalf(pcm16: ShortArray, sampleRate: Int): ShortArray {
+    override fun extractHalf(pcm16: ShortArray, sampleRate: Int): ShortArray {
         if (nativeReady(pcm16, sampleRate)) {
             val out = try {
                 nativeExtractHalf(pcm16, sampleRate)
@@ -153,12 +153,12 @@ class WhisperFeatureExtractor {
      * touched by newly appended PCM are recomputed; normalization is a cheap
      * linear pass over the cached 80x3000 raw-mel matrix.
      */
-    inner class IncrementalCache {
+    inner class IncrementalCache : WhisperIncrementalMelCache {
         private val pcm = ShortArray(CHUNK_SAMPLES)
         private val rawMel = FloatArray(N_MELS * N_FRAMES) { 1e-10f }
         private var sampleCount = 0
 
-        fun append(samples: ShortArray, sampleRate: Int): ShortArray {
+        override fun append(samples: ShortArray, sampleRate: Int): ShortArray {
             require(sampleRate == SAMPLE_RATE) { "Whisper expects 16000 Hz, got $sampleRate" }
             val oldCount = sampleCount
             val copy = min(samples.size, CHUNK_SAMPLES - oldCount)
@@ -190,7 +190,7 @@ class WhisperFeatureExtractor {
             return out
         }
 
-        fun reset() {
+        override fun reset() {
             pcm.fill(0)
             rawMel.fill(1e-10f)
             sampleCount = 0

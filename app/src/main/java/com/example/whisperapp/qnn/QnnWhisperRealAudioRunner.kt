@@ -9,6 +9,8 @@ import ai.onnxruntime.TensorInfo
 import android.content.Context
 import android.util.Log
 import com.example.whisperapp.asr.WhisperTokenizer
+import com.example.whisperapp.asr.TraditionalChineseBlocklist
+import com.example.whisperapp.asr.WhisperVariant
 import com.example.whisperapp.audio.WhisperFeatureExtractor
 import java.io.File
 import java.nio.ByteBuffer
@@ -25,15 +27,10 @@ import kotlin.math.min
 object QnnWhisperRealAudioRunner {
     private const val TAG = "QNN_WHISPER_REAL"
     private const val EP_NAME = "QNNExecutionProvider"
-    private const val EOS_TOKEN = 50257
-    private const val START_OF_TRANSCRIPT_TOKEN = 50258
-    private const val ZH_LANGUAGE_TOKEN = 50260
-    private const val TRANSCRIBE_TOKEN = 50359
-    private const val NO_TIMESTAMPS_TOKEN = 50363
     private const val MAX_STEPS = 16
     private const val MAX_GENERATION_STEPS = 195
-    // Whisper language token: <|zh|>; the previous prompt forced English.
-    private val forcedPrompt = intArrayOf(START_OF_TRANSCRIPT_TOKEN, ZH_LANGUAGE_TOKEN, TRANSCRIBE_TOKEN, NO_TIMESTAMPS_TOKEN)
+    /** The forced prompt is always <|sot|><|zh|><|transcribe|><|notimestamps|>. */
+    private const val PROMPT_LENGTH = 4
     private val crossNames = (0 until 4).flatMap { listOf("k_cache_cross_$it", "v_cache_cross_$it") }
     private val selfInNames = (0 until 4).flatMap { listOf("k_cache_self_${it}_in", "v_cache_self_${it}_in") }
     private val selfOutNames = (0 until 4).flatMap { listOf("k_cache_self_${it}_out", "v_cache_self_${it}_out") }
@@ -48,6 +45,33 @@ object QnnWhisperRealAudioRunner {
     private var profileServer: QnnProfileServer? = null
     private var profileDir: File? = null
     private var cachedTokenizer: WhisperTokenizer? = null
+    private var tokenizerVariant: WhisperVariant? = null
+
+    /** Variant whose sessions/assets are currently loaded (null before the first [start]). */
+    @Volatile
+    private var activeVariant: WhisperVariant? = null
+
+    /**
+     * Resolves the prompt/stop token IDs from the loaded tokenizer instead of hard-coded
+     * constants: Large-V3 inserts `<|yue|>`, shifting <|transcribe|>/<|notimestamps|> by one
+     * relative to Tiny while the text vocabulary itself is identical.
+     */
+    private fun promptFor(tokenizer: WhisperTokenizer): IntArray = intArrayOf(
+        tokenizer.idFor("<|startoftranscript|>"),
+        tokenizer.idFor("<|zh|>"),
+        tokenizer.idFor("<|transcribe|>"),
+        tokenizer.idFor("<|notimestamps|>"),
+    )
+
+    private fun eosFor(tokenizer: WhisperTokenizer): Int = tokenizer.idFor("<|endoftext|>")
+
+    private fun tokenizerFor(context: Context, variant: WhisperVariant): WhisperTokenizer {
+        cachedTokenizer?.let { if (tokenizerVariant == variant) return it }
+        val tokenizer = WhisperTokenizer.fromAssets(context.assets, variant.tokenizerAssetDir, variant.vocabSize)
+        cachedTokenizer = tokenizer
+        tokenizerVariant = variant
+        return tokenizer
+    }
 
     data class Result(val passed: Boolean, val report: String, val tokenIds: IntArray = IntArray(0), val text: String = "")
     /**
@@ -83,24 +107,26 @@ object QnnWhisperRealAudioRunner {
         sessionsProfiled = null
     }
 
-    fun start(context: Context) {
+    fun start(context: Context, variant: WhisperVariant = WhisperVariant.TINY) {
         synchronized(lifecycleLock) {
             val appContext = context.applicationContext
             val qnnProfileRoot = File(appContext.filesDir, "qnn-profile")
             if (profileServer == null) profileServer = QnnProfileServer(qnnProfileRoot).also { it.start() }
-            if (env != null && encoderSession != null && decoderSession != null && sessionsProfiled == profilingEnabled) return
+            if (env != null && encoderSession != null && decoderSession != null &&
+                sessionsProfiled == profilingEnabled && activeVariant == variant
+            ) return
             if (encoderSession != null || decoderSession != null) {
-                // profiling/debug flag flipped since these sessions were built — rebuild them
+                // profiling/debug flag or variant changed since these sessions were built — rebuild them
                 closeSessionsLocked()
             }
-            Log.i(TAG, "QNN_LIFECYCLE START")
-            val encoderModel = copyAsset(appContext, "models/whisper/encoder_ctx.onnx")
-            val decoderModel = copyAsset(appContext, "models/whisper/decoder_ctx.onnx")
+            Log.i(TAG, "QNN_LIFECYCLE START variant=${variant.name}")
+            val encoderModel = copyAsset(appContext, variant.encoderModelAsset, variant)
+            val decoderModel = copyAsset(appContext, variant.decoderModelAsset, variant)
             // EPContext wrappers use a relative ep_cache_context (encoder.bin / decoder.bin).
             // ORT resolves that path relative to the wrapper ONNX file, so the binaries must
             // already exist beside the copied wrapper before createSession() is called.
-            val encoderBinary = copyAsset(appContext, "models/whisper/encoder.bin")
-            val decoderBinary = copyAsset(appContext, "models/whisper/decoder.bin")
+            val encoderBinary = copyAsset(appContext, variant.encoderBinaryAsset, variant)
+            val decoderBinary = copyAsset(appContext, variant.decoderBinaryAsset, variant)
             check(encoderBinary.isFile && encoderBinary.length() > 0) {
                 "Encoder EPContext binary missing: ${encoderBinary.absolutePath}"
             }
@@ -160,12 +186,13 @@ object QnnWhisperRealAudioRunner {
             check(encoderSession!!.outputNames.toSet() == crossNames.toSet()) { "encoder outputs=${encoderSession!!.outputNames}" }
             check(decoderSession!!.inputNames.size == 19) { "decoder inputs=${decoderSession!!.inputNames}" }
             check(decoderSession!!.outputNames.toSet() == (selfOutNames + "logits").toSet()) { "decoder outputs=${decoderSession!!.outputNames}" }
-            if (debugDiagnostics) validateDecoderContract(decoderSession!!)
+            if (debugDiagnostics) validateDecoderContract(decoderSession!!, variant)
             // Preload the tokenizer so the first transcribed chunk doesn't pay ~750 ms of
             // vocab parsing inside the real-time loop; chunks 2+ reuse the cached instance.
             OpTrace.time("tokenizer.preload", "init") {
-                cachedTokenizer ?: WhisperTokenizer.fromAssets(appContext.assets).also { cachedTokenizer = it }
+                tokenizerFor(appContext, variant)
             }
+            activeVariant = variant
             lifecycleChunk = 0
         }
     }
@@ -178,13 +205,14 @@ object QnnWhisperRealAudioRunner {
         autoregressive: Boolean = false,
         precomputedMelHalf: ShortArray? = null,
         debugUpdateId: Int? = null,
+        variant: WhisperVariant = WhisperVariant.TINY,
     ): Result {
         synchronized(lifecycleLock) {
-            start(context)
+            start(context, variant)
             lifecycleChunk++
             val debugId = debugUpdateId ?: lifecycleChunk
-            Log.i("WHISPER_DEBUG", "QNN_START #$debugId samples=${pcm16.size} cachedMel=${precomputedMelHalf != null} melSize=${precomputedMelHalf?.size ?: 0}")
-            Log.i(TAG, "QNN_CHUNK START #$lifecycleChunk")
+            Log.i("WHISPER_DEBUG", "QNN_START #$debugId variant=${variant.name} samples=${pcm16.size} cachedMel=${precomputedMelHalf != null} melSize=${precomputedMelHalf?.size ?: 0}")
+            Log.i(TAG, "QNN_CHUNK START #$lifecycleChunk variant=${variant.name}")
             val runId = OpTrace.beginRun(
                 "chunk_$lifecycleChunk",
                 mapOf(
@@ -192,10 +220,11 @@ object QnnWhisperRealAudioRunner {
                     "sample_rate" to sampleRate.toString(),
                     "requested_steps" to requestedSteps.toString(),
                     "autoregressive" to autoregressive.toString(),
+                    "variant" to variant.name,
                 )
             )
             return try {
-                transcribeChunkLocked(context.applicationContext, pcm16, sampleRate, requestedSteps, autoregressive, precomputedMelHalf, debugId)
+                transcribeChunkLocked(context.applicationContext, pcm16, sampleRate, requestedSteps, autoregressive, precomputedMelHalf, debugId, variant)
             } finally {
                 OpTrace.endRun(runId, pcm16.size / sampleRate.toDouble())
                 Log.i("WHISPER_DEBUG", "QNN_RETURN #$debugId")
@@ -223,13 +252,17 @@ object QnnWhisperRealAudioRunner {
         autoregressive: Boolean = false,
         precomputedMelHalf: ShortArray? = null,
         debugUpdateId: Int? = null,
+        variant: WhisperVariant = WhisperVariant.TINY,
     ): Result {
-        require(if (autoregressive) requestedSteps in 1..(forcedPrompt.size - 1 + MAX_GENERATION_STEPS) else requestedSteps in 1..MAX_STEPS)
+        require(
+            if (autoregressive) requestedSteps in 1..(PROMPT_LENGTH - 1 + MAX_GENERATION_STEPS)
+            else requestedSteps in 1..MAX_STEPS
+        )
         require(sampleRate == WhisperFeatureExtractor.SAMPLE_RATE) { "Whisper expects 16000 Hz, got $sampleRate" }
         return try {
-            Log.i(TAG, "START requestedSteps=$requestedSteps samples=${pcm16.size} sampleRate=$sampleRate")
-            start(context)
-            transcribeChunk(context, pcm16, sampleRate, requestedSteps, autoregressive, precomputedMelHalf)
+            Log.i(TAG, "START variant=${variant.name} requestedSteps=$requestedSteps samples=${pcm16.size} sampleRate=$sampleRate")
+            start(context, variant)
+            transcribeChunk(context, pcm16, sampleRate, requestedSteps, autoregressive, precomputedMelHalf, variant = variant)
         } catch (t: Throwable) {
             Log.e("WHISPER_DEBUG", "TRANSCRIBE_ERROR #$debugUpdateId type=${t::class.java.name} message=${t.message}", t)
             Log.e(TAG, "FAIL: ${t.javaClass.name}: ${t.message}", t)
@@ -247,27 +280,28 @@ object QnnWhisperRealAudioRunner {
         autoregressive: Boolean,
         precomputedMelHalf: ShortArray?,
         debugUpdateId: Int,
+        variant: WhisperVariant,
     ): Result {
         return try {
-            Log.i("WHISPER_DEBUG", "TRANSCRIBE_LOCKED #$debugUpdateId audioSamples=${pcm16.size} precomputedMel=${precomputedMelHalf != null} melSize=${precomputedMelHalf?.size ?: 0} requestedSteps=$requestedSteps autoregressive=$autoregressive")
+            Log.i("WHISPER_DEBUG", "TRANSCRIBE_LOCKED #$debugUpdateId variant=${variant.name} audioSamples=${pcm16.size} precomputedMel=${precomputedMelHalf != null} melSize=${precomputedMelHalf?.size ?: 0} requestedSteps=$requestedSteps autoregressive=$autoregressive")
             val tokenizer = OpTrace.time("tokenizer.load", "preprocess") {
-                cachedTokenizer ?: WhisperTokenizer.fromAssets(context.assets).also { cachedTokenizer = it }
+                tokenizerFor(context, variant)
             }
-            Log.i(TAG, "TOKENIZER_READY cached=${cachedTokenizer != null}")
+            Log.i(TAG, "TOKENIZER_READY variant=${variant.name} vocab=${tokenizer.vocabularySize}")
             val melFloat: FloatArray?
             val melHalf: ShortArray?
             if (precomputedMelHalf != null) {
-                require(precomputedMelHalf.size == 80 * 3000) { "precomputed mel size=" + precomputedMelHalf.size }
+                require(precomputedMelHalf.size == variant.nMels * variant.nFrames) { "precomputed mel size=" + precomputedMelHalf.size }
                 melFloat = null
                 melHalf = precomputedMelHalf
                 Log.i(TAG, "MEL_REUSE cached_incremental=true elements=" + melHalf.size)
                 Log.i("WHISPER_DEBUG", "MEL_REUSE #$debugUpdateId cached=true elements=${melHalf.size}")
             } else if (debugDiagnostics) {
-                val extractor = WhisperFeatureExtractor()
+                val extractor = variant.newFrontend()
                 melFloat = OpTrace.time("mel.extract", "preprocess") { extractor.extract(pcm16, sampleRate).data }
                 melHalf = null
             } else {
-                val extractor = WhisperFeatureExtractor()
+                val extractor = variant.newFrontend()
                 melFloat = null
                 melHalf = OpTrace.time("mel.extract", "preprocess") { extractor.extractHalf(pcm16, sampleRate) }
             }
@@ -287,11 +321,11 @@ object QnnWhisperRealAudioRunner {
                     appendLine("pcm_samples=${pcm16.size}")
                     appendLine("mel.dtype=float32")
                     appendLine("mel.elements=$melSize")
-                    appendLine("mel.shape=1x80x3000")
+                    appendLine("mel.shape=1x${variant.nMels}x${variant.nFrames}")
                 })
             }
             LongAudioAppLogger.info("MEL_READY elements=$melSize half=${melHalf != null}")
-            val output = runLoop(context, melFloat, melHalf, pcm16.size, sampleRate, tokenizer, requestedSteps, autoregressive, diagnosticDir)
+            val output = runLoop(context, melFloat, melHalf, pcm16.size, sampleRate, tokenizer, requestedSteps, autoregressive, diagnosticDir, variant)
             Log.i("WHISPER_DEBUG", "RUNLOOP_DONE #$debugUpdateId tokenCount=${output.second.size} text=\"${if (output.third.isBlank()) "<EMPTY>" else output.third.take(160)}\"")
             Result(true, output.first, output.second, output.third)
         } catch (t: Throwable) {
@@ -301,42 +335,45 @@ object QnnWhisperRealAudioRunner {
         }
     }
 
-    private fun runLoop(context: Context, melFloat: FloatArray?, melHalf: ShortArray?, pcmSamples: Int, sampleRate: Int, tokenizer: WhisperTokenizer, requestedSteps: Int, autoregressive: Boolean, diagnosticDir: File): Triple<String, IntArray, String> {
-        val encoderBinary = copyAsset(context, "models/whisper/encoder.bin")
-        val decoderBinary = copyAsset(context, "models/whisper/decoder.bin")
+    private fun runLoop(context: Context, melFloat: FloatArray?, melHalf: ShortArray?, pcmSamples: Int, sampleRate: Int, tokenizer: WhisperTokenizer, requestedSteps: Int, autoregressive: Boolean, diagnosticDir: File, variant: WhisperVariant): Triple<String, IntArray, String> {
+        val encoderBinary = copyAsset(context, variant.encoderBinaryAsset, variant)
+        val decoderBinary = copyAsset(context, variant.decoderBinaryAsset, variant)
+        val forcedPrompt = promptFor(tokenizer)
+        val eosToken = eosFor(tokenizer)
         val env = this.env ?: error("QNN runner is not started")
         val encoderSession = this.encoderSession ?: error("encoder session not initialized")
         val decoderSession = this.decoderSession ?: error("decoder session not initialized")
         val tensors = mutableListOf<OnnxTensor>()
         try {
-            Log.i(TAG, "ENCODER_SESSION_REUSE")
+            Log.i(TAG, "ENCODER_SESSION_REUSE variant=${variant.name}")
             check(encoderSession.inputNames == setOf("input_features")) { "encoder inputs=${encoderSession.inputNames}" }
             check(encoderSession.outputNames.toSet() == crossNames.toSet()) { "encoder outputs=${encoderSession.outputNames}" }
             check(decoderSession.inputNames.size == 19) { "decoder inputs=${decoderSession.inputNames}" }
             check(decoderSession.outputNames.toSet() == (selfOutNames + "logits").toSet()) { "decoder outputs=${decoderSession.outputNames}" }
-            if (debugDiagnostics) validateDecoderContract(decoderSession)
+            if (debugDiagnostics) validateDecoderContract(decoderSession, variant)
 
-            check((melFloat?.size ?: melHalf!!.size) == 1 * 80 * 3000) { "feature element count mismatch" }
+            check((melFloat?.size ?: melHalf!!.size) == 1 * variant.nMels * variant.nFrames) { "feature element count mismatch" }
             val featureStats = if (debugDiagnostics) {
                 val s = floatStats(melFloat!!)
                 check(s.nan == 0 && s.inf == 0 && s.nonZero > 0) { "feature stats=$s" }
                 s
             } else null
+            val featureShape = longArrayOf(1, variant.nMels.toLong(), variant.nFrames.toLong())
             val inputFeatures = if (melHalf != null) {
                 // FP16 path: the extractor already produced binary16 samples.
-                OnnxTensor.createTensor(env, ShortBuffer.wrap(melHalf), longArrayOf(1, 80, 3000), OnnxJavaType.FLOAT16)
+                OnnxTensor.createTensor(env, ShortBuffer.wrap(melHalf), featureShape, OnnxJavaType.FLOAT16)
                     .also { tensors += it }
             } else {
                 OpTrace.time("fp32_to_fp16", "preprocess", mapOf("elements" to melFloat!!.size.toString())) {
-                    f16FromFloat(env, melFloat, longArrayOf(1, 80, 3000), tensors)
+                    f16FromFloat(env, melFloat, featureShape, tensors)
                 }
             }
             val inputShorts = if (debugDiagnostics) melHalf ?: ShortArray(melFloat!!.size) { floatToHalf(melFloat[it]) } else null
             if (debugDiagnostics) {
                 writeFloat16(diagnosticDir.resolve("encoder_input.bin"), inputShorts!!)
-                appendMetadata(diagnosticDir, "encoder_input.dtype=float16\nencoder_input.elements=${inputShorts.size}\nencoder_input.shape=1x80x3000\n")
+                appendMetadata(diagnosticDir, "encoder_input.dtype=float16\nencoder_input.elements=${inputShorts.size}\nencoder_input.shape=1x${variant.nMels}x${variant.nFrames}\n")
             }
-            Log.i(TAG, "ENCODER_INPUT_READY shape=[1, 80, 3000] dtype=FP16")
+            Log.i(TAG, "ENCODER_INPUT_READY shape=[1, ${variant.nMels}, ${variant.nFrames}] dtype=FP16")
             Log.i("WHISPER_DEBUG", "ENCODER_INPUT #$lifecycleChunk checksum=${halfChecksum(inputFeatures.getShortBuffer())}")
             Log.i(TAG, "ENCODER_OUTPUT_READY names=${encoderSession.outputNames}")
             val crossInputs = LinkedHashMap<String, OnnxTensor>()
@@ -350,7 +387,7 @@ object QnnWhisperRealAudioRunner {
                         val index = encoderSession.outputNames.toList().indexOf(name)
                         check(index >= 0) { "missing encoder output $name" }
                         val out = result[index] as OnnxTensor
-                        val shape = if (name.startsWith("k_")) longArrayOf(6, 1, 64, 1500) else longArrayOf(6, 1, 1500, 64)
+                        val shape = variant.kvShape(name.startsWith("k_"), 1500)
                         OpTrace.time("encoder.host_copy", "host", mapOf("tensor" to name)) {
                             if (debugDiagnostics) {
                                 val s = halfStats(out.getShortBuffer())
@@ -374,7 +411,7 @@ object QnnWhisperRealAudioRunner {
             Log.i("WHISPER_DEBUG", "ENCODER_DONE #$lifecycleChunk encoderMs=$encoderMs")
 
             var selfKv: Map<String, OnnxTensor> = LinkedHashMap<String, OnnxTensor>().also { m ->
-                for (name in selfInNames) m[name] = f16(env, selfShape(name), tensors)
+                for (name in selfInNames) m[name] = f16(env, variant.selfInShape(name), tensors)
             }
             var prevResult: OrtSession.Result? = null
             val forcedValidationMode = !autoregressive
@@ -404,6 +441,7 @@ object QnnWhisperRealAudioRunner {
                     crossKvInputs = crossInputs,
                     attentionMask = attentionMask,
                     owner = stepTensors,
+                    variant = variant,
                 )
                 val logitsStats = if (debugDiagnostics) {
                     OpTrace.time("decoder.host_copy", "host", mapOf("step" to step.toString(), "part" to "logits_stats")) {
@@ -412,15 +450,15 @@ object QnnWhisperRealAudioRunner {
                         s
                     }
                 } else null
-                val nextToken = OpTrace.time("decoder.argmax", "host", mapOf("step" to step.toString(), "vocab" to "51865")) {
-                    argmaxHalf(stepResult.logits.getShortBuffer())
+                val nextToken = OpTrace.time("decoder.argmax", "host", mapOf("step" to step.toString(), "vocab" to variant.vocabSize.toString())) {
+                    argmaxHalf(stepResult.logits.getShortBuffer(), TraditionalChineseBlocklist.blockedTokenIds)
                 }
                 check(nextToken >= 0) { "step=$step argmax failed" }
                 if (debugDiagnostics) {
                     val topK = OpTrace.time("decoder.topk", "host", mapOf("step" to step.toString(), "k" to "5")) {
                         topKHalf(stepResult.logits.getShortBuffer(), 5)
                     }
-                    val eosLogit = halfAt(stepResult.logits.getShortBuffer(), EOS_TOKEN)
+                    val eosLogit = halfAt(stepResult.logits.getShortBuffer(), eosToken)
                     LongAudioAppLogger.info("QNN_COMPARE_STEP step=$step inputToken=$inputToken position=$step top1=$nextToken eosLogit=$eosLogit maxLogit=${topK.firstOrNull()?.second ?: Float.NaN}")
                     LongAudioAppLogger.info("QNN_COMPARE_TOPK step=$step ${topK.joinToString(" ") { pair -> "${pair.first}:${pair.second}" }}")
                 }
@@ -450,11 +488,11 @@ object QnnWhisperRealAudioRunner {
                 // The last prompt input already predicts the first generated token.
                 if (!forcedValidationMode && step >= forcedPrompt.size - 1) {
                     generationStepsCompleted++
-                    if (nextToken == EOS_TOKEN) {
+                    if (nextToken == eosToken) {
                         generated += nextToken
                         eosReached = true
                         LongAudioAppLogger.info("DECODER_GENERATED step=$step count=${generated.size} lastToken=$nextToken ids=${generated.take(20)}")
-                        LongAudioAppLogger.info("DECODER_EOS step=$step tokenId=$EOS_TOKEN")
+                        LongAudioAppLogger.info("DECODER_EOS step=$step tokenId=$eosToken")
                     } else {
                         generated += nextToken
                         currentToken = nextToken
@@ -497,7 +535,8 @@ object QnnWhisperRealAudioRunner {
                 appendLine("sample_rate: $sampleRate")
                 appendLine("channels: mono")
                 appendLine("pcm_samples: $pcmSamples")
-                appendLine("features: [1,80,3000] FP32")
+                appendLine("variant: ${variant.name}")
+                appendLine("features: [1,${variant.nMels},${variant.nFrames}] FP32")
                 if (featureStats != null) {
                     appendLine("feature_min: ${featureStats.min}")
                     appendLine("feature_max: ${featureStats.max}")
@@ -522,7 +561,7 @@ object QnnWhisperRealAudioRunner {
                 appendLine("self_kv_finite: true")
                 appendLine("forced_prompt: ${forcedPrompt.contentToString()}")
                 appendLine("eos_reached: $eosReached")
-                appendLine("eos_token: $EOS_TOKEN")
+                appendLine("eos_token: $eosToken")
                 appendLine("token_ids: ${generated.joinToString(",")}")
                 appendLine("decoded_text: $decodedText")
                 appendLine("cpu_fallback: disabled=true")
@@ -549,6 +588,7 @@ object QnnWhisperRealAudioRunner {
         crossKvInputs: Map<String, OnnxTensor>,
         attentionMask: OnnxTensor,
         owner: MutableList<OnnxTensor>,
+        variant: WhisperVariant,
     ): DecoderStepResult {
         val inputs = LinkedHashMap<String, OnnxTensor>()
         inputs["input_ids"] = i32(env, longArrayOf(1, 1), inputToken, owner)
@@ -588,7 +628,7 @@ object QnnWhisperRealAudioRunner {
         return DecoderStepResult(result, logits ?: error("step=$step logits missing"), nextSelfKv)
     }
 
-    private fun validateDecoderContract(session: OrtSession) {
+    private fun validateDecoderContract(session: OrtSession, variant: WhisperVariant) {
         val inputInfo = session.inputInfo
         fun assertInfo(name: String, shape: LongArray, type: OnnxJavaType) {
             val info = inputInfo[name]?.info as? TensorInfo ?: error("Missing input $name")
@@ -597,15 +637,13 @@ object QnnWhisperRealAudioRunner {
         assertInfo("input_ids", longArrayOf(1, 1), OnnxJavaType.INT32)
         assertInfo("position_ids", longArrayOf(1), OnnxJavaType.INT32)
         for (i in 0 until 4) {
-            assertInfo("k_cache_self_${i}_in", longArrayOf(6, 1, 64, 199), OnnxJavaType.FLOAT16)
-            assertInfo("v_cache_self_${i}_in", longArrayOf(6, 1, 199, 64), OnnxJavaType.FLOAT16)
-            assertInfo("k_cache_cross_$i", longArrayOf(6, 1, 64, 1500), OnnxJavaType.FLOAT16)
-            assertInfo("v_cache_cross_$i", longArrayOf(6, 1, 1500, 64), OnnxJavaType.FLOAT16)
+            assertInfo("k_cache_self_${i}_in", variant.kvShape(true, variant.selfCacheLength), OnnxJavaType.FLOAT16)
+            assertInfo("v_cache_self_${i}_in", variant.kvShape(false, variant.selfCacheLength), OnnxJavaType.FLOAT16)
+            assertInfo("k_cache_cross_$i", variant.kvShape(true, 1500), OnnxJavaType.FLOAT16)
+            assertInfo("v_cache_cross_$i", variant.kvShape(false, 1500), OnnxJavaType.FLOAT16)
         }
-        assertInfo("attention_mask", longArrayOf(1, 1, 1, 200), OnnxJavaType.FLOAT16)
+        assertInfo("attention_mask", longArrayOf(1, 1, 1, variant.maxDecodeLength.toLong()), OnnxJavaType.FLOAT16)
     }
-
-    private fun selfShape(name: String) = if (name.startsWith("k_")) longArrayOf(6, 1, 64, 199) else longArrayOf(6, 1, 199, 64)
 
     /**
      * The graph appends the current token after 199 cache slots, then returns the
@@ -616,7 +654,7 @@ object QnnWhisperRealAudioRunner {
         return OnnxTensor.createTensor(
             env,
             ShortBuffer.wrap(values),
-            longArrayOf(1, 1, 1, 200),
+            longArrayOf(1, 1, 1, WhisperDecoderMask.WIDTH.toLong()),
             OnnxJavaType.FLOAT16
         ).also { owner += it }
     }
@@ -673,7 +711,7 @@ object QnnWhisperRealAudioRunner {
     }
 
     private fun halfStats(buffer: ShortBuffer): HalfStats { val c = buffer.duplicate(); var min = Float.POSITIVE_INFINITY; var max = Float.NEGATIVE_INFINITY; var sum = 0.0; var finite = 0; var nan = 0; var inf = 0; var nonZero = 0; while (c.hasRemaining()) { val v = halfToFloat(c.get().toInt() and 0xffff); when { v.isNaN() -> nan++; v.isInfinite() -> inf++; else -> { finite++; if (v < min) min = v; if (v > max) max = v; sum += v.toDouble(); if (v != 0f) nonZero++ } } }; return HalfStats(min, max, if (finite == 0) Double.NaN else sum / finite, finite, nan, inf, nonZero) }
-    private fun argmaxHalf(buffer: ShortBuffer): Int { val c = buffer.duplicate(); var best = Float.NEGATIVE_INFINITY; var bestIndex = -1; var i = 0; while (c.hasRemaining()) { val v = halfToFloat(c.get().toInt() and 0xffff); if (v.isFinite() && v > best) { best = v; bestIndex = i }; i++ }; return bestIndex }
+    private fun argmaxHalf(buffer: ShortBuffer, blocked: Set<Int> = emptySet()): Int { val c = buffer.duplicate(); var best = Float.NEGATIVE_INFINITY; var bestIndex = -1; var i = 0; while (c.hasRemaining()) { val v = halfToFloat(c.get().toInt() and 0xffff); if (v.isFinite() && v > best && i !in blocked) { best = v; bestIndex = i }; i++ }; return bestIndex }
     private fun halfAt(buffer: ShortBuffer, index: Int): Float { val c = buffer.duplicate(); c.position(index); return halfToFloat(c.get().toInt() and 0xffff) }
     private fun topKHalf(buffer: ShortBuffer, k: Int): List<Pair<Int, Float>> {
         val c = buffer.duplicate()
@@ -746,15 +784,31 @@ object QnnWhisperRealAudioRunner {
         })
     }
 
-    private fun copyAsset(context: Context, asset: String): File {
-        val f = File(context.cacheDir, asset.substringAfterLast('/'))
+    private fun copyAsset(context: Context, asset: String, variant: WhisperVariant): File {
+        // Each variant keeps its own directory: Tiny and Turbo both ship files named
+        // encoder.bin / decoder.bin / *_ctx.onnx, and an EPContext wrapper resolves its
+        // relative ep_cache_context against the wrapper's own directory.
+        val dir = File(context.cacheDir, "whisper-${variant.name.lowercase()}").apply { mkdirs() }
+        val f = File(dir, asset.substringAfterLast('/'))
         // Context binaries are immutable; skip the copy when a same-size file already exists.
-        // (Re-copying 116 MB of encoder/decoder bins per chunk cost ~1.3 s.)
+        // (Re-copying the ~2.2 GB of Turbo binaries per chunk would dominate every update.)
+        val size = assetLength(context, asset)
+        if (size > 0 && f.isFile && f.length() == size) return f
         context.assets.open(asset).use { input ->
-            val size = input.available().toLong()
-            if (f.isFile && f.length() == size) return f
             f.outputStream().use { output -> input.copyTo(output) }
         }
         return f
     }
+
+    /** Uncompressed assets expose an fd; compressed ones do not (then we always re-copy). */
+    private fun assetLength(context: Context, asset: String): Long =
+        try {
+            context.assets.openFd(asset).use { it.length }
+        } catch (_: Throwable) {
+            try {
+                context.assets.open(asset).use { it.available().toLong() }
+            } catch (_: Throwable) {
+                -1L
+            }
+        }
 }

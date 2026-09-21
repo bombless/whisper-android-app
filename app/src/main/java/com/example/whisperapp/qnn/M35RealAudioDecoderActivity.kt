@@ -3,27 +3,58 @@ package com.example.whisperapp.qnn
 import android.app.Activity
 import android.os.Bundle
 import android.util.Log
+import com.example.whisperapp.asr.WhisperVariant
 import com.example.whisperapp.audio.WavPcmReader
 import java.io.File
 
+/**
+ * Runs a fixed WAV through the QNN Whisper path and writes a report, giving a
+ * deterministic alternative to the live-microphone flow.
+ *
+ *   adb shell am start -n com.example.whisperapp/.qnn.M35RealAudioDecoderActivity --es variant turbo
+ *
+ * Reads `<externalFilesDir>/output.wav` (16 kHz mono PCM16).
+ */
 class M35RealAudioDecoderActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         Thread {
+            var variant = WhisperVariant.TINY
             try {
+                variant = when (intent.getStringExtra("variant")?.lowercase()) {
+                    "turbo", "large", "large_v3_turbo", "large-v3-turbo" -> WhisperVariant.LARGE_V3_TURBO
+                    else -> WhisperVariant.TINY
+                }
+                Log.i(TAG, "START variant=${variant.name} assetDir=${variant.assetDir}")
                 val wav = File(getExternalFilesDir(null), "output.wav")
-                Log.i("M35_REAL_DECODER", "START wav=${wav.absolutePath} exists=${wav.isFile}")
+                Log.i(TAG, "WAV path=${wav.absolutePath} exists=${wav.isFile} bytes=${if (wav.isFile) wav.length() else -1}")
                 val pcm = wav.inputStream().use { WavPcmReader.read(it) }
-                Log.i("M35_REAL_DECODER", "PCM16 samples=${pcm.samples.size} rate=${pcm.sampleRate} channels=${pcm.channels}")
-                val result = QnnWhisperRealAudioRunner.run(this, pcm.samples, pcm.sampleRate, requestedSteps = 128, autoregressive = true)
-                File(getExternalFilesDir(null), "m35_real_audio_decoder_result.txt").writeText(result.report)
-                Log.e("M35_REAL_DECODER", "RESULT_WRITTEN passed=${result.passed}")
+                Log.i(TAG, "PCM samples=${pcm.samples.size} rate=${pcm.sampleRate} channels=${pcm.channels}")
+                val result = QnnWhisperRealAudioRunner.run(
+                    context = this,
+                    pcm16 = pcm.samples,
+                    sampleRate = pcm.sampleRate,
+                    requestedSteps = 128,
+                    autoregressive = true,
+                    variant = variant,
+                )
+                File(getExternalFilesDir(null), resultFileName(variant)).writeText(result.report)
+                Log.i(TAG, "RESULT_WRITTEN variant=${variant.name} passed=${result.passed}")
+                Log.i(TAG, "DECODED_TEXT variant=${variant.name} text=\"${result.text}\"")
             } catch (t: Throwable) {
-                File("/sdcard/Download/m35_real_audio_decoder_result.txt").writeText("ACTIVITY EXCEPTION\n${t.stackTraceToString()}")
-                Log.e("M35_REAL_DECODER", "ACTIVITY EXCEPTION", t)
+                runCatching {
+                    File(getExternalFilesDir(null), resultFileName(variant)).writeText("ACTIVITY EXCEPTION\n${t.stackTraceToString()}")
+                }
+                Log.e(TAG, "ACTIVITY EXCEPTION", t)
             }
             runOnUiThread { finish() }
         }.start()
     }
-}
 
+    private fun resultFileName(variant: WhisperVariant) =
+        "m35_real_audio_decoder_result_${variant.name.lowercase()}.txt"
+
+    private companion object {
+        const val TAG = "M35_REAL_DECODER"
+    }
+}
