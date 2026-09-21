@@ -322,14 +322,15 @@ fun MainScreen() {
                 Tab(selected = selectedTab == 2, onClick = { switchToTab(2) }, text = { Text("聊天") })
             }
             Spacer(Modifier.height(20.dp))
+            // The scroll lives inside the TTS/STT panes only: scrolling the whole box gave the
+            // chat pane an unbounded height, which collapsed its weighted message list to ~0 dp.
             Box(
                 Modifier
                     .weight(1f)
                     .fillMaxWidth()
-                    .verticalScroll(contentScrollState)
             ) {
             if (selectedTab == 0) {
-                Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(20.dp)) {
+                Column(Modifier.fillMaxWidth().verticalScroll(contentScrollState), verticalArrangement = Arrangement.spacedBy(20.dp)) {
                     Column(Modifier.fillMaxWidth()) {
                         Text("文字转语音", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.SemiBold)
                         Spacer(Modifier.height(8.dp))
@@ -373,7 +374,7 @@ fun MainScreen() {
                     ) { Text("播放语音") }
                 }
             } else if (selectedTab == 1) {
-                Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(20.dp)) {
+                Column(Modifier.fillMaxWidth().verticalScroll(contentScrollState), verticalArrangement = Arrangement.spacedBy(20.dp)) {
                     Column(Modifier.fillMaxWidth()) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Box(Modifier.size(12.dp).background(if (recording) Color(0xFF42A85F) else MaterialTheme.colorScheme.outline, CircleShape))

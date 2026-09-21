@@ -40,8 +40,11 @@ Install/verify `qai-hub-models`, then run model info for `Whisper-Tiny` and `Mel
 - Turbo assets added: `encoder_ctx.onnx` + `decoder_ctx.onnx` EPContext wrappers generated
   from the asset's `metadata.json`, the Large-V3 tokenizer, and an incremental cache on the
   128-bin mel frontend for the live loop.
-- On-device results: encoder 1390.9 ms for a 30 s window, ~20 ms per decoder step, ~1.6 s per
-  1-second live update, `cpu_fallback: disabled`, `dsp_crash: false`.
+- On-device results: encoder ~590 ms for a 30 s window (604.7 / 593.8 / 587.1 ms over three
+  consecutive runs), ~20 ms per decoder step, `cpu_fallback: disabled`, `dsp_crash: false`. The
+  encoder was 1390.9 ms before the QNN EP started voting `htp_performance_mode`: ORT's default
+  (`"default"`) makes no `QnnHtpPerfInfrastructure` call at all, so the HTP had no clock/bus vote.
+  See `TURBO_QNN_RESULTS.md`.
 - The same WAV through Tiny and Turbo yields an identical token sequence and text, which
   cross-validates both paths. Turbo decodes `你好呀 你会说话吗 你应该不会说话吧你说几句来听听呀`.
 - Details, contract table, evidence and known limitations: `TURBO_QNN_RESULTS.md`.

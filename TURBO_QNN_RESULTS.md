@@ -85,6 +85,11 @@ dsp_crash: false
 decoded_text: 你好呀 你会说话吗 你应该不会说话吧你说几句来听听呀
 ```
 
+`encoder_ms` in that report was taken before the HTP performance vote was added; the same fixed WAV
+now reports 604.7 / 593.8 / 587.1 ms (see
+[Encoder latency](#encoder-latency-the-missing-htp-performance-vote)). Decoded text, token IDs and
+`forced_prompt` are unchanged.
+
 Running the same WAV through Tiny with the same request produces a **byte-identical token
 sequence and text**, while reporting its own prompt IDs:
 
@@ -110,16 +115,62 @@ RESULT #3 text="你好你好你好"
 RESULT #4 text="你好你好你好吗"
 ```
 
-Per-update wall time was ~1.6 s, dominated by the 1.39 s encoder; decoder steps cost
-~20 ms each. For 30 s of audio that is an encoder RTF of roughly 0.05, so the model is
-far from the bottleneck.
+Per-update wall time was ~1.6 s at the time, dominated by the 1.39 s encoder (see the next
+section: that encoder number was 2.3x too high); decoder steps cost ~20 ms each. For 30 s of
+audio that is an encoder RTF of roughly 0.05, so the model is far from the bottleneck.
+
+## Encoder latency: the missing HTP performance vote
+
+The 1390.9 ms encoder above was not a property of the Turbo asset. The app never set
+`htp_performance_mode`, and ONNX Runtime's QNN EP treats that as `"default"`, which makes **no
+`QnnHtpPerfInfrastructure` call at all**: no HVX/HMX clock floor and no NoC/DDR bus vote, so the
+HTP simply stays in whatever DCVS state the platform picked. Qualcomm AI Hub profiles every
+`qnn_context_binary` with burst, which is what its published 466.4 ms encoder number reflects.
+
+Measured on RMX3800 / SM8650 / HTP v75 with the 1.75 GB `encoder.bin` and the fixed 30 s
+`[1,128,3000]` window (`encoder_run_ms` is the per-execution duration with the QNN accelerator
+busy time confirmed independently through `profiling_level=optrace`):
+
+| `htp_performance_mode` | Encoder execution | Notes |
+|---|---:|---|
+| unset (ORT default) | 1343.8, 1304.6, 1365.0 ms | three consecutive executions in one session — not a first-run artifact |
+| `sustained_high_performance` | 604.7, 593.8, 587.1 ms | shipped default (thermally sustainable) |
+| `burst` | 630.0 ms | AI Hub's profiling profile |
+| `high_performance` | 644.6 ms | |
+| `rpc_control_latency=100` | 829.9 ms | slower; leave at ORT's default |
+| `qnn_context_priority=high` | 588.0 ms | no effect |
+| `htp_graph_finalization_optimization_mode=3` | 1386.9 ms | no effect |
+| `vtcm_mb=8` | 610.4 ms | no effect |
+
+The QNN optrace profile explains why: with the default profile the encoder is limited by
+accelerator busy time (1323.8 ms of `Accelerator (execute) time`, 3.89e9 cycles — 41.6 % conv2d,
+32.9 % softmax, 13.2 % matmul), while under a performance vote the same graph finishes in ~590 ms.
+The decoder never showed the gap (HTP execute ~9-11 ms vs AI Hub's 7.96 ms), because it is a short
+matmul-dominated graph rather than a long clock-bound conv/softmax one — so this was never a
+generic "the app is slow" problem, and it was never mel either: the live loop feeds precomputed
+incremental mel into `transcribeChunk`, and `encoder_ms` is measured around `session.run` only.
+
+Why the other knobs do nothing here: `vtcm_mb`, `htp_graph_finalization_optimization_mode` and
+`enable_htp_fp16_precision` are turned into QNN *graph* configs by ORT only on its JIT compile
+path; with a precompiled context binary ORT loads the `.bin` directly and never applies them.
+Those would have to be re-linked offline through AI Hub (`default_graph_htp_vtcm_size=...`,
+`default_graph_htp_optimizations=O=3`).
+
+`QnnWhisperRealAudioRunner` now votes `htp_performance_mode=sustained_high_performance` on both
+sessions and also passes the run-level `qnn.perf_mode` (ORT gates its DSPQ polling on it), and it
+exposes the diagnostic knobs used for the sweep above through
+`configureHtp(...)` / `M35RealAudioDecoderActivity` extras.
 
 ## Latency
 
-| Stage | Tiny | Turbo |
-|---|---:|---:|
-| Encoder (30 s window) | 239.8 ms | 1390.9 ms |
-| Decoder step | ~20 ms | ~20 ms |
+| Stage | Tiny | Turbo (before) | Turbo (now) |
+|---|---:|---:|---:|
+| Encoder (30 s window) | 239.8 ms | 1390.9 ms | ~590 ms |
+| Decoder step | ~20 ms | ~20 ms | ~20 ms |
+
+AI Hub's own figure for this asset and device is 466.4 ms encoder / 7.96 ms decoder; the residual
+gap is methodology (their number is a minimum over many hosted, non-throttled iterations in burst)
+rather than a missing option.
 
 ## Files
 
@@ -135,7 +186,8 @@ Added:
 Changed:
 
 - `QnnWhisperRealAudioRunner.kt`: variant-parameterised; per-variant cache directory;
-  `openFd`-based asset length check
+  `openFd`-based asset length check; votes `htp_performance_mode` plus the run-level
+  `qnn.perf_mode` on every execution and exposes `configureHtp(...)` for the diagnostic sweep
 - `WhisperTokenizer.kt`: `expectedVocabSize`, `idFor`, `vocabularySize`; the
   transcribe/notimestamps assertions are no longer hard-coded
 - `WhisperFeatureExtractor.kt` / `WhisperTurboFeatureExtractor.kt`: implement the
@@ -144,7 +196,8 @@ Changed:
 - `app/build.gradle.kts`: `unitTests.isReturnDefaultValues` (the incremental-cache tests
   previously failed with `Method i in android.util.Log not mocked`), and a comment
   explaining why assets stay uncompressed
-- `M35RealAudioDecoderActivity.kt`: accepts `--es variant tiny|turbo`
+- `M35RealAudioDecoderActivity.kt`: accepts `--es variant tiny|turbo`, plus the diagnostic
+  `perf`, `runopt`, `rpc`, `prio`, `vtcm`, `fin`, `extra_key`/`extra_value` and `repeats` extras
 
 ## Tests
 

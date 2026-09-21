@@ -9,7 +9,7 @@ import android.content.Context
 import android.util.Log
 import java.io.File
 import java.nio.FloatBuffer
-import java.nio.IntBuffer
+import java.nio.LongBuffer
 
 /** Native LFM2.5 runner: ONNX Runtime QNN EP + HTP, with no WebView/WASM. */
 object QnnLfm2ChatRunner {
@@ -17,6 +17,12 @@ object QnnLfm2ChatRunner {
     private const val EP = "QNNExecutionProvider"
     private const val MODEL_ASSET = "chat/models/LFM2.5-230M-ONNX/onnx/model_q4.onnx"
     private const val DATA_PREFIX = "chat/models/LFM2.5-230M-ONNX/onnx/model_q4.onnx_data.part"
+    /**
+     * Name the graph itself declares for its external data (`external_data.location` of every
+     * external initializer). ORT resolves it relative to the model file, so the concatenated
+     * chunks must land under exactly this name — not after the .onnx asset name.
+     */
+    private const val EXTERNAL_DATA_NAME = "model_q4f32.onnx_data"
     private const val MAX_TOKENS = 256
     private val CONV_LAYERS = intArrayOf(0, 1, 3, 5, 7, 9, 11, 13)
     private val KV_LAYERS = intArrayOf(2, 4, 6, 8, 10, 12)
@@ -26,7 +32,6 @@ object QnnLfm2ChatRunner {
     private var env: OrtEnvironment? = null
     private var session: OrtSession? = null
     private var tokenizer: Lfm2Tokenizer? = null
-    private var qnnRegistered = false
     private val lock = Any()
 
     fun start(context: Context): Status = synchronized(lock) {
@@ -35,11 +40,10 @@ object QnnLfm2ChatRunner {
             val model = copyAsset(app, MODEL_ASSET)
             copyExternalData(app, model.parentFile ?: app.cacheDir)
             if (env == null) env = OrtEnvironment.getEnvironment(OrtLoggingLevel.ORT_LOGGING_LEVEL_WARNING, TAG)
-            if (!qnnRegistered) {
-                System.loadLibrary("onnxruntime_providers_qnn")
-                env!!.registerExecutionProviderLibrary(EP, "libonnxruntime_providers_qnn.so")
-                qnnRegistered = true
-            }
+            // The environment (and therefore the QNN EP registration) is shared with the Whisper
+            // ASR runner, which keeps its registration alive after recording stops; the gate below
+            // is idempotent and also re-registers if a smoke-test activity removed the provider.
+            QnnEpRegistration.ensureRegistered(env!!)
             if (session == null) {
                 val device = env!!.epDevices.firstOrNull { it.epName == EP }
                     ?: error("QNNExecutionProvider device not exposed")
@@ -47,7 +51,10 @@ object QnnLfm2ChatRunner {
                 check(backend.isFile) { "HTP backend missing: ${backend.absolutePath}" }
                 val options = OrtSession.SessionOptions().apply {
                     setSessionLogLevel(OrtLoggingLevel.ORT_LOGGING_LEVEL_WARNING)
-                    addConfigEntry("session.disable_cpu_ep_fallback", "1")
+                    // CPU fallback must stay enabled: the graph declares int64 index inputs, which
+                    // QNN/HTP does not consume natively (ORT inserts int64->int32 casts on CPU).
+                    // Disabling fallback makes createSession() fail outright, exactly like the
+                    // Whisper EPContext wrappers documented in QnnWhisperRealAudioRunner.
                     addExecutionProvider(listOf(device), mapOf(
                         "backend_path" to backend.absolutePath,
                         "soc_model" to "57",
@@ -75,6 +82,8 @@ object QnnLfm2ChatRunner {
         val s = session!!
         val promptIds = tok.encode(buildPrompt(history)).toMutableList()
         require(promptIds.isNotEmpty()) { "Prompt tokenization produced no tokens" }
+        val startedNs = System.nanoTime()
+        Log.i(TAG, "GENERATE_START history=${history.size} promptTokens=${promptIds.size} firstIds=${promptIds.take(4)}")
 
         val past = HashMap<String, FloatArray>()
         var pastLen = 0
@@ -86,9 +95,10 @@ object QnnLfm2ChatRunner {
             val inputs = LinkedHashMap<String, OnnxTensor>()
             val owned = ArrayList<OnnxTensor>()
             try {
-                inputs["input_ids"] = intTensor(inputIds.toIntArray(), longArrayOf(1, sequenceLength.toLong()), owned)
-                inputs["attention_mask"] = intTensor(IntArray(pastLen + sequenceLength) { 1 }, longArrayOf(1, (pastLen + sequenceLength).toLong()), owned)
-                inputs["position_ids"] = intTensor(IntArray(sequenceLength) { pastLen + it }, longArrayOf(1, sequenceLength.toLong()), owned)
+                // The exported graph declares input_ids/attention_mask/position_ids as int64.
+                inputs["input_ids"] = longTensor(inputIds.map { it.toLong() }.toLongArray(), longArrayOf(1, sequenceLength.toLong()), owned)
+                inputs["attention_mask"] = longTensor(LongArray(pastLen + sequenceLength) { 1L }, longArrayOf(1, (pastLen + sequenceLength).toLong()), owned)
+                inputs["position_ids"] = longTensor(LongArray(sequenceLength) { (pastLen + it).toLong() }, longArrayOf(1, sequenceLength.toLong()), owned)
 
                 for (layer in CONV_LAYERS) {
                     inputs["past_conv.$layer"] = floatTensor(
@@ -111,8 +121,8 @@ object QnnLfm2ChatRunner {
 
                 s.run(inputs).use { result ->
                     val outputs = s.outputNames.associateWith { name -> result[s.outputNames.indexOf(name)] as OnnxTensor }
-                    val logits = outputs.getValue("logits").floatBuffer
-                    val nextToken = argmax(logits)
+                    val logits = outputs.getValue("logits")
+                    val nextToken = argmaxLastPosition(logits)
                     generatedIds += nextToken
 
                     for (layer in CONV_LAYERS) {
@@ -128,10 +138,19 @@ object QnnLfm2ChatRunner {
             }
 
             pastLen += sequenceLength
-            if (generatedIds.last() == Lfm2Tokenizer.EOS_ID) return@synchronized tok.decode(generatedIds.toIntArray())
+            if (generatedIds.last() == Lfm2Tokenizer.EOS_ID) {
+                return@synchronized finish(tok, generatedIds, startedNs)
+            }
             inputIds = mutableListOf(generatedIds.last())
         }
-        return@synchronized tok.decode(generatedIds.toIntArray())
+        return@synchronized finish(tok, generatedIds, startedNs)
+    }
+
+    private fun finish(tok: Lfm2Tokenizer, ids: List<Int>, startedNs: Long): String {
+        val text = tok.decode(ids.toIntArray())
+        val elapsedMs = (System.nanoTime() - startedNs) / 1_000_000
+        Log.i(TAG, "GENERATE_DONE tokens=${ids.size} elapsedMs=$elapsedMs text=\"${text.take(200)}\"")
+        return text
     }
 
     fun stop() = synchronized(lock) {
@@ -139,8 +158,9 @@ object QnnLfm2ChatRunner {
         session = null
     }
 
+    /** Mirrors the model's own chat template (tokenizer_config.json), including its exact BOS. */
     private fun buildPrompt(history: List<Pair<String, String>>): String = buildString {
-        append("<|startoftext|>\n")
+        append("<|startoftext|>")
         for ((role, content) in history) {
             append("<|im_start|>").append(role).append('\n')
             append(content)
@@ -149,15 +169,19 @@ object QnnLfm2ChatRunner {
         append("<|im_start|>assistant\n")
     }
 
-    private fun argmax(buffer: FloatBuffer): Int {
-        val b = buffer.duplicate()
+    /**
+     * `logits` has shape [1, sequence_length, vocab]; only the last position predicts the next
+     * token. Reading the maximum over the whole buffer would also consider the prompt positions.
+     */
+    private fun argmaxLastPosition(tensor: OnnxTensor): Int {
+        val shape = tensor.info.shape
+        val vocab = shape[shape.size - 1].toInt()
+        val b = tensor.floatBuffer
         var best = Float.NEGATIVE_INFINITY
         var bestIndex = 0
-        var i = 0
-        while (b.hasRemaining()) {
-            val v = b.get()
+        for (i in 0 until vocab) {
+            val v = b.get(b.limit() - vocab + i)
             if (v > best) { best = v; bestIndex = i }
-            i++
         }
         return bestIndex
     }
@@ -169,8 +193,8 @@ object QnnLfm2ChatRunner {
         return out
     }
 
-    private fun intTensor(data: IntArray, shape: LongArray, owned: MutableList<OnnxTensor>) =
-        OnnxTensor.createTensor(env!!, IntBuffer.wrap(data), shape).also { owned += it }
+    private fun longTensor(data: LongArray, shape: LongArray, owned: MutableList<OnnxTensor>) =
+        OnnxTensor.createTensor(env!!, LongBuffer.wrap(data), shape).also { owned += it }
 
     private fun floatTensor(data: FloatArray, shape: LongArray, owned: MutableList<OnnxTensor>) =
         OnnxTensor.createTensor(env!!, FloatBuffer.wrap(data), shape).also { owned += it }
@@ -187,7 +211,7 @@ object QnnLfm2ChatRunner {
     }
 
     private fun copyExternalData(context: Context, dir: File): File {
-        val target = File(dir, "model_q4.onnx_data")
+        val target = File(dir, EXTERNAL_DATA_NAME)
         val assetDir = DATA_PREFIX.substringBeforeLast('/')
         val prefix = DATA_PREFIX.substringAfterLast('/')
         val names = context.assets.list(assetDir)?.filter { it.startsWith(prefix) }?.sorted() ?: emptyList()

@@ -20,8 +20,37 @@ class Lfm2Tokenizer private constructor(
     )
     private val byteEncoder: Map<Int, Char> = buildByteEncoder()
 
+    /**
+     * `<|im_start|>`, `<|im_end|>`, … must be matched atomically: running the byte-level BPE over
+     * them would emit `<`, `|`, `im`, `_start`, … instead of the single special id the model was
+     * trained on. Hugging Face tokenizers behave the same way (added tokens are extracted before
+     * the pre-tokenizer runs), so the prompt must be split on these tokens first.
+     */
+    private val specialPattern: Pattern? = special.keys
+        .sortedByDescending { it.length }
+        .takeIf { it.isNotEmpty() }
+        ?.let { Pattern.compile(it.joinToString("|") { token -> Pattern.quote(token) }) }
+
     fun encode(text: String): IntArray {
         val ids = ArrayList<Int>()
+        val pattern = specialPattern
+        if (pattern == null) {
+            encodeOrdinary(text, ids)
+            return ids.toIntArray()
+        }
+        val matcher = pattern.matcher(text)
+        var index = 0
+        while (matcher.find()) {
+            if (matcher.start() > index) encodeOrdinary(text.substring(index, matcher.start()), ids)
+            ids += special.getValue(matcher.group())
+            index = matcher.end()
+        }
+        if (index < text.length) encodeOrdinary(text.substring(index), ids)
+        return ids.toIntArray()
+    }
+
+    /** Byte-level BPE for a span that is known to contain no special token. */
+    private fun encodeOrdinary(text: String, ids: MutableList<Int>) {
         val matcher = splitPattern.matcher(text)
         while (matcher.find()) {
             val token = matcher.group()
@@ -46,7 +75,6 @@ class Lfm2Tokenizer private constructor(
             }
             for (s in symbols) ids += vocab[s] ?: error("LFM tokenizer token missing from vocab: $s")
         }
-        return ids.toIntArray()
     }
 
     fun decode(ids: IntArray): String {
