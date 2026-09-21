@@ -103,6 +103,30 @@ object OpTrace {
         return e
     }
 
+    /**
+     * Crash/stall breadcrumbs written straight to a file.
+     *
+     * Some OEM ROMs drop this app's logcat output entirely, which makes a native stall
+     * invisible: the process sits at 0% CPU with no stack and no log line. Every stage
+     * boundary in the native decode path appends here, so a hang can be localised to the
+     * exact call that never returned.
+     */
+    @Volatile private var stageFile: File? = null
+
+    fun stageLogFile(file: File?) {
+        synchronized(lock) {
+            stageFile = file
+            runCatching { file?.writeText("") }
+        }
+    }
+
+    fun stage(message: String) {
+        val f = stageFile ?: return
+        val line = "${fmt((System.nanoTime() - epoch) / 1_000_000.0)}ms $message"
+        Log.i(TAG, "STAGE $message")
+        runCatching { synchronized(lock) { f.appendText(line + "\n") } }
+    }
+
     /** Time a block as a span. */
     inline fun <T> time(name: String, category: String, attrs: Map<String, String> = emptyMap(), block: () -> T): T {
         if (!enabled) return block()

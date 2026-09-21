@@ -21,7 +21,14 @@ internal object QnnEpRegistration {
 
     private const val TAG = "QNN_EP"
     private const val NATIVE_LIBRARY = "onnxruntime_providers_qnn"
-    private const val PLUGIN_LIBRARY = "libonnxruntime_providers_qnn.so"
+
+    /**
+     * File name of the QNN EP plugin, resolvable inside `nativeLibraryDir`.
+     *
+     * Also used by the native decoder session (P1), which must register the same plugin into
+     * its own `Ort::Env` — the QNN EP is not linked into `libonnxruntime.so`.
+     */
+    const val PLUGIN_LIBRARY = "libonnxruntime_providers_qnn.so"
 
     /**
      * Makes sure the QNN EP is registered in [env].

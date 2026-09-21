@@ -12,6 +12,7 @@
         <activity android:name=".qnn.M35RealAudioEncoderActivity" android:exported="true" />
         <activity android:name=".qnn.M35RealAudioDecoderActivity" android:exported="true" />
         <activity android:name=".qnn.LongAudioVerificationActivity" android:exported="true" />
+        <activity android:name=".qnn.P0LoopbackVerificationActivity" android:exported="true" />
         <activity android:name=".qnn.WhisperReferenceActivity" android:exported="true" />
         <activity android:name=".qnn.WhisperEncoderDiagnosticActivity" android:exported="true" />
         <provider

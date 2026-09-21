@@ -42,7 +42,7 @@ class QnnProfileServer(private val root: File, private val port: Int = 8765) {
         while (running) {
             try {
                 val s = server?.accept() ?: break
-                pool.execute { handle(s) }
+                pool.execute { runCatching { handle(s) }.onFailure { Log.w(tag, "HANDLE_FAILED ${it.javaClass.name}: ${it.message}", it) } }
             } catch (_: Throwable) {}
         }
     }
@@ -66,19 +66,29 @@ class QnnProfileServer(private val root: File, private val port: Int = 8765) {
             val rawTarget = p[1]
             val path = URLDecoder.decode(rawTarget.substringBefore("?"), "UTF-8")
             val query = URLDecoder.decode(rawTarget.substringAfter("?", ""), "UTF-8")
-            when {
-                path == "/" && method == "GET" -> respond(w, 200, "text/html; charset=utf-8", DASHBOARD_HTML)
-                path == "/api/status.json" && method == "GET" -> respond(w, 200, "application/json", statusJson())
-                path == "/api/profile.json" && method == "GET" -> respond(w, 200, "application/json", profileJson())
-                path == "/api/trace.json" && method == "GET" -> respond(w, 200, "application/json", traceJson())
-                path == "/api/events.json" && method == "GET" -> respond(w, 200, "application/json", eventsJson())
-                path == "/api/config" -> respond(w, 200, "application/json", configJson(query))
-                path == "/api/trace/clear" && (method == "POST" || method == "GET") -> {
-                    OpTrace.clear()
-                    respond(w, 200, "application/json", "{\"cleared\":true}")
+            // Every branch is wrapped: an exception used to escape handle() and kill the
+            // socket mid-response, which the client sees as a bare disconnect with no clue
+            // what failed (the CSV endpoints parse files on the request thread).
+            try {
+                when {
+                    path == "/" && method == "GET" -> respond(w, 200, "text/html; charset=utf-8", DASHBOARD_HTML)
+                    path == "/api/status.json" && method == "GET" -> respond(w, 200, "application/json", statusJson())
+                    path == "/api/profile.json" && method == "GET" -> respond(w, 200, "application/json", profileJson())
+                    path == "/api/trace.json" && method == "GET" -> respond(w, 200, "application/json", traceJson())
+                    path == "/api/events.json" && method == "GET" -> respond(w, 200, "application/json", eventsJson())
+                    path == "/api/config" -> respond(w, 200, "application/json", configJson(query))
+                    path == "/api/trace/clear" && (method == "POST" || method == "GET") -> {
+                        OpTrace.clear()
+                        respond(w, 200, "application/json", "{\"cleared\":true}")
+                    }
+                    path.startsWith("/download/") && method == "GET" -> download(w, path.removePrefix("/download/"))
+                    else -> respond(w, 404, "application/json", "{\"error\":\"not found\"}")
                 }
-                path.startsWith("/download/") && method == "GET" -> download(w, path.removePrefix("/download/"))
-                else -> respond(w, 404, "application/json", "{\"error\":\"not found\"}")
+            } catch (t: Throwable) {
+                Log.w(tag, "REQUEST_FAILED path=$path: ${t.javaClass.name}: ${t.message}", t)
+                runCatching {
+                    respond(w, 500, "application/json", "{\"error\":${OpTrace.jsonEscape(t.javaClass.name + ": " + t.message).let { "\"$it\"" }}}")
+                }
             }
         }
     }
@@ -112,7 +122,7 @@ class QnnProfileServer(private val root: File, private val port: Int = 8765) {
         val csvFiles = fs.filter { it.extension.equals("csv", true) && it.lastModified() >= bootWallMs }
         // aggregate the newest encoder/decoder csvs (one inference each after stop())
         val newest = csvFiles.takeLast(2)
-        val ops = newest.flatMap { OpTrace.parseQnnOptraceCsv(it) }
+        val ops = newest.flatMap { qnnOps(it) }
         val recentRuns = snap.runs.takeLast(16).reversed()
         return buildString {
             append("{\"schema\":\"whisper-optrace-v2\",\"enabled\":${snap.enabled},")
@@ -123,6 +133,22 @@ class QnnProfileServer(private val root: File, private val port: Int = 8765) {
             append("\"qnn_ops\":[${ops.joinToString(",") { OpTrace.opJson(it) }}],")
             append("\"files\":[${fs.joinToString(",") { fileJson(it) }}]}")
         }
+    }
+
+    /**
+     * Optrace CSVs are tens of MB and parsing one takes seconds, while the dashboard polls
+     * every 2 s. Parsing on the request thread used to stall the poll into the minutes when
+     * a fresh multi-MB CSV appeared. Results are cached by (path, size, mtime), so a CSV is
+     * parsed once and then served from memory until the file actually changes.
+     */
+    private val qnnOpsCache = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, List<OpTrace.OpAggregate>>>()
+
+    private fun qnnOps(f: File): List<OpTrace.OpAggregate> {
+        val stamp = f.length() xor (f.lastModified() shl 8)
+        qnnOpsCache[f.absolutePath]?.let { (cachedStamp, ops) -> if (cachedStamp == stamp) return ops }
+        val ops = OpTrace.parseQnnOptraceCsv(f)
+        qnnOpsCache[f.absolutePath] = stamp to ops
+        return ops
     }
 
     private fun eventsJson(): String {

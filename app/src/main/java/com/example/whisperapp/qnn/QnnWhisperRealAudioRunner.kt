@@ -63,6 +63,32 @@ object QnnWhisperRealAudioRunner {
     private var lifecycleChunk = 0
 
     /**
+     * P1: native decode loop (OrtSession + OrtIoBinding) that keeps cross-KV and the
+     * attention mask device-resident. Null whenever the native library is unavailable or
+     * creation failed, in which case [runLoop] uses the Java path unchanged.
+     */
+    private var nativeDecoder: QnnWhisperDecoderJni.Handle? = null
+    private var nativeDecoderModelPath: String? = null
+
+    /**
+     * When true the decode loop runs through [QnnWhisperDecoderJni] instead of
+     * `OrtSession.run` with host tensors.
+     *
+     * **Default is false (Java path).** The native IoBinding loop is verified to produce
+     * identical tokens, but measured on SM8650 it is *not* faster than the Java path
+     * (13.5–14.2 ms/step vs ~12.6 ms) and does not remove `encoder.host_copy`, because that
+     * cost is incurred when the *encoder* output is copied back to the host — binding it into
+     * the decoder afterwards cannot undo it. Since P1 was justified purely by that expected
+     * saving, shipping it would add native lifecycle risk for no gain.
+     *
+     * Kept enabled-by-request for the follow-up that would actually pay off: binding the
+     * encoder's own output OrtValue straight into the decoder (true zero copy). Toggle with
+     * [setNativeDecode] or the activity's `--es decode native`.
+     */
+    @Volatile
+    private var nativeDecodeEnabled = false
+
+    /**
      * Diagnostic QNN EP / HTP overrides (e.g. `htp_performance_mode`, `vtcm_mb`,
      * `htp_graph_finalization_optimization_mode`). Empty means the shipped configuration.
      * Entries replace provider options of the same name.
@@ -79,12 +105,29 @@ object QnnWhisperRealAudioRunner {
     private var encoderRepeats = 0
 
     /** Sets [htpOverrides]/[encoderRepeats] and drops any live session so they take effect. */
-    fun configureHtp(overrides: Map<String, String>? = null, repeats: Int? = null) {
+    fun configureHtp(overrides: Map<String, String>? = null, repeats: Int? = null, nativeDecode: Boolean? = null) {
         synchronized(lifecycleLock) {
             overrides?.let { htpOverrides = it }
             repeats?.let { encoderRepeats = it.coerceIn(0, 8) }
+            // A/B switch for the P1 native decode loop: the same input can be decoded through
+            // both paths in one process to compare tokens and per-step time directly.
+            nativeDecode?.let { nativeDecodeEnabled = it }
             closeSessionsLocked()
-            Log.i(TAG, "CONFIG_HTP overrides=$htpOverrides encoderRepeats=$encoderRepeats")
+            Log.i(TAG, "CONFIG_HTP overrides=$htpOverrides encoderRepeats=$encoderRepeats nativeDecode=$nativeDecodeEnabled")
+        }
+    }
+
+    /**
+     * Switches the decode path for the *next* chunk without dropping the loaded sessions.
+     *
+     * Used by the P1 A/B harness: tearing sessions down between passes would re-enter
+     * `start()` and re-register the QNN EP plugin, which ORT only permits once per process.
+     */
+    fun setNativeDecode(enabled: Boolean) {
+        synchronized(lifecycleLock) {
+            nativeDecodeEnabled = enabled
+            Log.i(TAG, "SET_NATIVE_DECODE enabled=$enabled")
+            OpTrace.stage("set_native_decode enabled=$enabled")
         }
     }
 
@@ -142,6 +185,9 @@ object QnnWhisperRealAudioRunner {
     }
 
     private fun closeSessionsLocked() {
+        try { nativeDecoder?.close() } catch (_: Throwable) {}
+        nativeDecoder = null
+        nativeDecoderModelPath = null
         try { decoderSession?.close() } catch (_: Throwable) {}
         try { encoderSession?.close() } catch (_: Throwable) {}
         try { decoderOptions?.close() } catch (_: Throwable) {}
@@ -151,6 +197,51 @@ object QnnWhisperRealAudioRunner {
         decoderOptions = null
         encoderOptions = null
         sessionsProfiled = null
+    }
+
+    /**
+     * Builds the native decoder session for [modelPath] if it is not already open.
+     *
+     * Returns null (rather than throwing) on any failure, so callers transparently fall back
+     * to the Java loop. The native session is a second `OrtSession` over the same EPContext
+     * wrapper: it does not share state with [decoderSession], which is why the Java session
+     * stays alive as the fallback rather than being replaced.
+     */
+    private fun ensureNativeDecoderLocked(context: Context, variant: WhisperVariant, modelPath: String): QnnWhisperDecoderJni.Handle? {
+        if (!nativeDecodeEnabled) return null
+        nativeDecoder?.let { if (nativeDecoderModelPath == modelPath) return it }
+        nativeDecoder?.let { runCatching { it.close() } }
+        nativeDecoder = null
+        val backend = File(context.applicationInfo.nativeLibraryDir, "libQnnHtp.so")
+        if (!backend.isFile) return null
+        // The QNN EP is a plugin, not part of libonnxruntime.so: the native session must
+        // register this exact library into its own Ort::Env, just as QnnEpRegistration does
+        // for the shared Java environment.
+        val plugin = File(context.applicationInfo.nativeLibraryDir, QnnEpRegistration.PLUGIN_LIBRARY)
+        if (!plugin.isFile) {
+            OpTrace.stage("native.create.skip plugin missing ${plugin.absolutePath}")
+            return null
+        }
+        val handle = OpTrace.time("native_decoder.create", "init", mapOf("variant" to variant.name)) {
+            QnnWhisperDecoderJni.create(
+                modelPath = modelPath,
+                backendPath = backend.absolutePath,
+                socModel = "57",
+                htpArch = "75",
+                perfMode = htpOverrides["htp_performance_mode"] ?: HTP_PERFORMANCE_MODE,
+                pluginPath = plugin.absolutePath,
+                nHeads = variant.nHeads,
+                selfSlots = variant.selfCacheLength,
+                vocabSize = variant.vocabSize,
+            )
+        }
+        if (handle == null) {
+            Log.w(TAG, "NATIVE_DECODER_UNAVAILABLE variant=${variant.name}; using Java decode loop")
+            return null
+        }
+        nativeDecoder = handle
+        nativeDecoderModelPath = modelPath
+        return handle
     }
 
     fun start(context: Context, variant: WhisperVariant = WhisperVariant.TINY) {
@@ -166,6 +257,7 @@ object QnnWhisperRealAudioRunner {
                 closeSessionsLocked()
             }
             Log.i(TAG, "QNN_LIFECYCLE START variant=${variant.name}")
+            OpTrace.stage("start.begin variant=${variant.name}")
             val encoderModel = copyAsset(appContext, variant.encoderModelAsset, variant)
             val decoderModel = copyAsset(appContext, variant.decoderModelAsset, variant)
             // EPContext wrappers use a relative ep_cache_context (encoder.bin / decoder.bin).
@@ -185,6 +277,14 @@ object QnnWhisperRealAudioRunner {
                 Log.i(TAG, "QNN_LIFECYCLE INIT_ORT")
             }
             val runtimeEnv = env!!
+            // The native decoder (P1) adopts the *shared* Java OrtEnvironment instead of
+            // creating its own: the QNN EP is a plugin that ORT allows to be registered only
+            // once per environment, so a second `Ort::Env` cannot load it
+            // ("library is already registered under QNNExecutionProvider"). Passing the Java
+            // env's native handle lets both paths share one environment and one registration.
+            val nativeEnvHandle = QnnWhisperDecoderJni.javaEnvHandle(runtimeEnv)
+            QnnWhisperDecoderJni.setSharedEnvHandle(nativeEnvHandle)
+            OpTrace.stage("start.shared_env handle=${nativeEnvHandle != 0L}")
             // Registration is process-wide (shared OrtEnvironment): the chat runner may have
             // registered the QNN EP already, and a smoke-test activity may have removed it again,
             // so the shared environment — not a local flag — decides whether to register.
@@ -222,13 +322,16 @@ object QnnWhisperRealAudioRunner {
             encoderOptions = makeOptions(File(runProfileDir, profilePrefix + "_encoder.csv"))
             decoderOptions = makeOptions(File(runProfileDir, profilePrefix + "_decoder.csv"))
             Log.i(TAG, "QNN_LIFECYCLE CREATE_ENCODER")
+            OpTrace.stage("start.create_encoder.begin")
             OpTrace.time("session.create", "init", mapOf("model" to "encoder")) {
                 encoderSession = runtimeEnv.createSession(encoderModel.absolutePath, encoderOptions)
             }
+            OpTrace.stage("start.create_encoder.end")
             Log.i(TAG, "QNN_LIFECYCLE CREATE_DECODER")
             OpTrace.time("session.create", "init", mapOf("model" to "decoder")) {
                 decoderSession = runtimeEnv.createSession(decoderModel.absolutePath, decoderOptions)
             }
+            OpTrace.stage("start.create_decoder.end")
             check(encoderSession!!.inputNames == setOf("input_features")) { "encoder inputs=${encoderSession!!.inputNames}" }
             check(encoderSession!!.outputNames.toSet() == crossNames.toSet()) { "encoder outputs=${encoderSession!!.outputNames}" }
             check(decoderSession!!.inputNames.size == 19) { "decoder inputs=${decoderSession!!.inputNames}" }
@@ -239,8 +342,45 @@ object QnnWhisperRealAudioRunner {
             OpTrace.time("tokenizer.preload", "init") {
                 tokenizerFor(appContext, variant)
             }
+            warmUpMelFrontend(variant)
+            OpTrace.stage("start.mel_warmup.end")
             activeVariant = variant
             lifecycleChunk = 0
+            OpTrace.stage("start.end")
+        }
+    }
+
+    /**
+     * P2-1: run one full mel extraction so the frontend's hot loops are JIT-compiled before
+     * the real-time loop starts.
+     *
+     * Measured on SM8650 the very first in-process `mel.extract` costs ~217 ms while the
+     * same call later in the process costs ~15 ms — that gap is interpreter/JIT warm-up,
+     * not work, and it lands entirely on the first preview update. Paying it here, behind
+     * the existing "STT native loading" UI state, removes it from the latency the user sees.
+     *
+     * Only the mel frontend is warmed. The encoder is deliberately left alone: it runs on
+     * the DSP, gains nothing from JIT, and one extra pass would cost ~573 ms of HTP time
+     * plus a session the HTP would have to re-finalize.
+     *
+     * The result is discarded and nothing here mutates model or session state, so this
+     * cannot change a single bit of any later transcription.
+     */
+    private fun warmUpMelFrontend(variant: WhisperVariant) {
+        try {
+            OpTrace.time("mel.warmup", "init", mapOf("variant" to variant.name)) {
+                val silence = ShortArray(WhisperFeatureExtractor.CHUNK_SAMPLES)
+                // Exercise both entry points the live loop uses: the incremental cache is
+                // what actually runs during recording, and `extractHalf` is the
+                // non-cached path (used by the one-shot runner activities).
+                val cache = variant.newMelCache()
+                cache.append(silence, WhisperFeatureExtractor.SAMPLE_RATE)
+                variant.newFrontend().extractHalf(silence, WhisperFeatureExtractor.SAMPLE_RATE)
+            }
+            Log.i(TAG, "MEL_WARMUP_DONE variant=${variant.name}")
+        } catch (t: Throwable) {
+            // A warm-up must never be able to break startup.
+            Log.w(TAG, "MEL_WARMUP_FAILED variant=${variant.name}: ${t.message}", t)
         }
     }
 
@@ -402,6 +542,11 @@ object QnnWhisperRealAudioRunner {
             check(encoderSession.outputNames.toSet() == crossNames.toSet()) { "encoder outputs=${encoderSession.outputNames}" }
             check(decoderSession.inputNames.size == 19) { "decoder inputs=${decoderSession.inputNames}" }
             check(decoderSession.outputNames.toSet() == (selfOutNames + "logits").toSet()) { "decoder outputs=${decoderSession.outputNames}" }
+            // Output name -> result index, resolved once. The step loop used to call
+            // session.outputNames (a fresh JNI-backed Set) and toList().indexOf(name) for every one
+            // of the 9 outputs on every one of up to 128 steps.
+            val encoderOutputIndex = encoderSession.outputNames.withIndex().associate { (index, name) -> name to index }
+            val decoderOutputIndex = decoderSession.outputNames.withIndex().associate { (index, name) -> name to index }
             if (debugDiagnostics) validateDecoderContract(decoderSession, variant)
 
             check((melFloat?.size ?: melHalf!!.size) == 1 * variant.nMels * variant.nFrames) { "feature element count mismatch" }
@@ -430,10 +575,13 @@ object QnnWhisperRealAudioRunner {
             Log.i(TAG, "ENCODER_OUTPUT_READY names=${encoderSession.outputNames}")
             val crossInputs = LinkedHashMap<String, OnnxTensor>()
             val encoderRunMs = mutableListOf<Double>()
+            /** Total host time spent copying encoder cross-KV outputs, to show P1's effect. */
+            var encoderHostCopyMs = 0.0
             for (pass in 0..encoderRepeats) {
                 val lastPass = pass == encoderRepeats
                 val encoderStart = System.nanoTime()
                 Log.i(TAG, "ENCODER_RUN_START pass=$pass last=$lastPass")
+                OpTrace.stage("encoder.run.begin pass=$pass")
                 OpTrace.time("encoder.run", "device", mapOf("pass" to pass.toString())) {
                     encoderSession.run(mapOf("input_features" to inputFeatures), runOptions).use { result ->
                         Log.i(TAG, "ENCODER_RUN_RETURN pass=$pass resultSize=${result.size()}")
@@ -441,10 +589,10 @@ object QnnWhisperRealAudioRunner {
                         // Warm-up passes only keep the loaded graph hot; their outputs are dropped.
                         if (!lastPass) return@use
                         for (name in crossNames) {
-                            val index = encoderSession.outputNames.toList().indexOf(name)
-                            check(index >= 0) { "missing encoder output $name" }
+                            val index = encoderOutputIndex.getValue(name)
                             val out = result[index] as OnnxTensor
                             val shape = variant.kvShape(name.startsWith("k_"), 1500)
+                            val copyStartNs = System.nanoTime()
                             OpTrace.time("encoder.host_copy", "host", mapOf("tensor" to name)) {
                                 if (debugDiagnostics) {
                                     val s = halfStats(out.getShortBuffer())
@@ -461,13 +609,50 @@ object QnnWhisperRealAudioRunner {
                                     appendMetadata(diagnosticDir, "encoder_output_${name}.dtype=float16\nencoder_output_${name}.elements=${outputShorts.size}\nencoder_output_${name}.shape=${shape.joinToString("x")}\n")
                                 }
                             }
+                            encoderHostCopyMs += (System.nanoTime() - copyStartNs) / 1_000_000.0
                         }
                     }
                 }
                 encoderRunMs += (System.nanoTime() - encoderStart) / 1_000_000.0
+                OpTrace.stage("encoder.run.end pass=$pass ms=${encoderRunMs.last()}")
                 Log.i("WHISPER_DEBUG", "ENCODER_DONE #$lifecycleChunk pass=$pass encoderMs=${encoderRunMs.last()}")
             }
             val encoderMs = encoderRunMs.last()
+            Log.i(TAG, "ENCODER_HOST_COPY_TOTAL ms=$encoderHostCopyMs")
+
+            // P1: if the native decoder is available, hand it the cross-KV *once* for this
+            // window. This is the whole point of the change — the Java path below re-uploads
+            // these 30.7 MB on every one of up to 128 steps.
+            val decoderModelForNative = copyAsset(context, variant.decoderModelAsset, variant)
+            var nativeHandle = if (crossInputs.isNotEmpty()) {
+                OpTrace.stage("native.ensure_decoder.begin")
+                ensureNativeDecoderLocked(context, variant, decoderModelForNative.absolutePath).also {
+                    OpTrace.stage("native.ensure_decoder.end handle=${it != null}")
+                }
+            } else null
+            if (nativeHandle != null) {
+                OpTrace.stage("native.bind_window.begin bytes=${flattenCrossKvBytes(variant)}")
+                val bound = nativeHandle.bindWindow(
+                    crossKvFlat = flattenCrossKv(crossInputs, variant),
+                    mask = WhisperDecoderMask.forPosition(0),
+                    position = 0,
+                )
+                OpTrace.stage("native.bind_window.end ok=$bound bindMs=${nativeHandle.lastBindMs}")
+                if (!bound) {
+                    Log.w(TAG, "NATIVE_DECODER_BIND_FAILED; using Java decode loop")
+                    runCatching { nativeHandle.close() }
+                    nativeDecoder = null
+                    nativeDecoderModelPath = null
+                    nativeHandle = null
+                } else {
+                    Log.i(TAG, "NATIVE_DECODER_BOUND crossBytes=${flattenCrossKvBytes(variant)} bindMs=${nativeHandle.lastBindMs}")
+                }
+            }
+            val useNativeDecoder = nativeHandle != null
+            // Reused across steps so the native path allocates no per-step logits array.
+            val nativeLogits = ShortArray(variant.vocabSize)
+            /** Per-step device time reported by the native loop, for the run report. */
+            val nativeStepMs = mutableListOf<Double>()
 
             var selfKv: Map<String, OnnxTensor> = LinkedHashMap<String, OnnxTensor>().also { m ->
                 for (name in selfInNames) m[name] = f16(env, variant.selfInShape(name), tensors)
@@ -487,38 +672,57 @@ object QnnWhisperRealAudioRunner {
                 val inputToken = if (forcedValidationMode) forcedPrompt[step % forcedPrompt.size] else if (step < forcedPrompt.size) forcedPrompt[step] else currentToken
                 val stepStart = System.nanoTime()
                 val stepTensors = mutableListOf<OnnxTensor>()
-                val attentionMask = OpTrace.time("decoder.mask", "host", mapOf("step" to step.toString())) {
-                    causalAttentionMask(env, step, stepTensors)
+                var logitsShorts: ShortArray? = null
+                val stepResult: DecoderStepResult? = if (useNativeDecoder) {
+                    // Native path: cross-KV and mask are already device-bound, so a step only
+                    // re-binds the two int32 inputs and the self-KV ping-pong buffers. The
+                    // mask rotation the Java path does per step is instead handled by the
+                    // native side's bound mask plus per-step position.
+                    OpTrace.time("decoder.run", "device", mapOf("step" to step.toString(), "path" to "native")) {
+                        OpTrace.stage("native.step.begin step=$step token=$inputToken")
+                        if (!nativeHandle!!.step(inputToken, step, nativeLogits)) {
+                            error("step=$step native decoder step failed")
+                        }
+                        OpTrace.stage("native.step.end step=$step ms=${nativeHandle!!.lastStepMs}")
+                    }.also { nativeStepMs += nativeHandle!!.lastStepMs }
+                    logitsShorts = nativeLogits
+                    null
+                } else {
+                    val attentionMask = OpTrace.time("decoder.mask", "host", mapOf("step" to step.toString())) {
+                        causalAttentionMask(env, step, stepTensors)
+                    }
+                    runDecoderStep(
+                        env = env,
+                        session = decoderSession,
+                        step = step,
+                        inputToken = inputToken,
+                        position = step,
+                        selfKvInputs = selfKv,
+                        crossKvInputs = crossInputs,
+                        attentionMask = attentionMask,
+                        owner = stepTensors,
+                        variant = variant,
+                        runOptions = runOptions,
+                        outputIndex = decoderOutputIndex,
+                    )
                 }
-                val stepResult = runDecoderStep(
-                    env = env,
-                    session = decoderSession,
-                    step = step,
-                    inputToken = inputToken,
-                    position = step,
-                    selfKvInputs = selfKv,
-                    crossKvInputs = crossInputs,
-                    attentionMask = attentionMask,
-                    owner = stepTensors,
-                    variant = variant,
-                    runOptions = runOptions,
-                )
+                val logitsBuffer = logitsShorts?.let { ShortBuffer.wrap(it) } ?: stepResult!!.logits.getShortBuffer()
                 val logitsStats = if (debugDiagnostics) {
                     OpTrace.time("decoder.host_copy", "host", mapOf("step" to step.toString(), "part" to "logits_stats")) {
-                        val s = halfStats(stepResult.logits.getShortBuffer())
+                        val s = halfStats(logitsBuffer)
                         check(s.nan == 0 && s.inf == 0) { "step=$step logits NaN=${s.nan} Inf=${s.inf}" }
                         s
                     }
                 } else null
                 val nextToken = OpTrace.time("decoder.argmax", "host", mapOf("step" to step.toString(), "vocab" to variant.vocabSize.toString())) {
-                    argmaxHalf(stepResult.logits.getShortBuffer(), TraditionalChineseBlocklist.blockedTokenIds)
+                    argmaxHalf(logitsBuffer, TraditionalChineseBlocklist.blockedMask)
                 }
                 check(nextToken >= 0) { "step=$step argmax failed" }
                 if (debugDiagnostics) {
                     val topK = OpTrace.time("decoder.topk", "host", mapOf("step" to step.toString(), "k" to "5")) {
-                        topKHalf(stepResult.logits.getShortBuffer(), 5)
+                        topKHalf(logitsBuffer, 5)
                     }
-                    val eosLogit = halfAt(stepResult.logits.getShortBuffer(), eosToken)
+                    val eosLogit = halfAt(logitsBuffer, eosToken)
                     LongAudioAppLogger.info("QNN_COMPARE_STEP step=$step inputToken=$inputToken position=$step top1=$nextToken eosLogit=$eosLogit maxLogit=${topK.firstOrNull()?.second ?: Float.NaN}")
                     LongAudioAppLogger.info("QNN_COMPARE_TOPK step=$step ${topK.joinToString(" ") { pair -> "${pair.first}:${pair.second}" }}")
                 }
@@ -527,7 +731,7 @@ object QnnWhisperRealAudioRunner {
                 var selfFinite = 0
                 var selfNan = 0
                 var selfInf = 0
-                if (debugDiagnostics) {
+                if (debugDiagnostics && stepResult != null) {
                     OpTrace.time("decoder.host_copy", "host", mapOf("step" to step.toString(), "part" to "self_kv_stats")) {
                         stepResult.nextSelfKv.values.forEach {
                             val stats = halfStats(it.getShortBuffer())
@@ -539,11 +743,13 @@ object QnnWhisperRealAudioRunner {
                     check(selfNan == 0 && selfInf == 0) { "step=$step selfKV nan=$selfNan inf=$selfInf" }
                 }
 
-                selfKv = stepResult.nextSelfKv
-                // The previous step's result (whose tensors were this step's inputs) is now
-                // fully consumed; release it only after the new run has finished reading them.
-                try { prevResult?.close() } catch (_: Throwable) {}
-                prevResult = stepResult.result
+                if (stepResult != null) {
+                    selfKv = stepResult.nextSelfKv
+                    // The previous step's result (whose tensors were this step's inputs) is now
+                    // fully consumed; release it only after the new run has finished reading them.
+                    try { prevResult?.close() } catch (_: Throwable) {}
+                    prevResult = stepResult.result
+                }
                 completedSteps++
                 // The last prompt input already predicts the first generated token.
                 if (!forcedValidationMode && step >= forcedPrompt.size - 1) {
@@ -632,6 +838,14 @@ object QnnWhisperRealAudioRunner {
                 appendLine("cpu_fallback: disabled=true")
                 appendLine("dsp_crash: false")
                 appendLine("encoder_ms: $encoderMs")
+                appendLine("decoder_path: ${if (useNativeDecoder) "native_iobinding" else "java_host_tensors"}")
+                appendLine("native_decoder_available: ${QnnWhisperDecoderJni.available}")
+                appendLine("native_cross_kv_bytes: ${if (useNativeDecoder) flattenCrossKvBytes(variant) else 0}")
+                appendLine("native_bind_ms: ${if (useNativeDecoder) String.format(Locale.US, "%.3f", nativeHandle!!.lastBindMs) else ""}")
+                appendLine("native_step_p50_ms: ${String.format(Locale.US, "%.3f", nativeStepMs.sorted().let { if (it.isEmpty()) 0.0 else it[it.size / 2] })}")
+                appendLine("native_step_min_ms: ${String.format(Locale.US, "%.3f", nativeStepMs.minOrNull() ?: 0.0)}")
+                appendLine("native_step_max_ms: ${String.format(Locale.US, "%.3f", nativeStepMs.maxOrNull() ?: 0.0)}")
+                appendLine("encoder_host_copy_ms: ${String.format(Locale.US, "%.3f", encoderHostCopyMs)}")
                 appendLine("encoder_run_ms: ${encoderRunMs.joinToString(",") { String.format(Locale.US, "%.3f", it) }}")
                 appendLine("encoder_repeats: $encoderRepeats")
                 appendLine("htp_overrides: ${htpOverrides.entries.sortedBy { it.key }.joinToString(",") { "${it.key}=${it.value}" }}")
@@ -659,6 +873,7 @@ object QnnWhisperRealAudioRunner {
         owner: MutableList<OnnxTensor>,
         variant: WhisperVariant,
         runOptions: OrtSession.RunOptions,
+        outputIndex: Map<String, Int>,
     ): DecoderStepResult {
         val inputs = LinkedHashMap<String, OnnxTensor>()
         inputs["input_ids"] = i32(env, longArrayOf(1, 1), inputToken, owner)
@@ -676,8 +891,7 @@ object QnnWhisperRealAudioRunner {
         // result only after the next run has finished reading them.
         check(result.size() == 9) { "step=$step decoder result size=${result.size()}" }
         for (name in selfOutNames + "logits") {
-            val index = session.outputNames.toList().indexOf(name)
-            check(index >= 0) { "missing decoder output $name" }
+            val index = outputIndex.getValue(name)
             val out = result[index] as OnnxTensor
             // Touch one element so lazy/async EPs materialize the tensor before it is
             // fed back as a next-step input (a no-op for synchronous EPs).
@@ -716,11 +930,35 @@ object QnnWhisperRealAudioRunner {
     }
 
     /**
+     * Packs the 8 cross-KV host tensors into one contiguous FP16 array in the order the
+     * native binder expects: `[k_0, v_0, k_1, v_1, ...]` — the same order as [crossNames].
+     *
+     * This is the single host<->device transfer per encoder window; the Java path performs
+     * the equivalent copy on *every* decode step, which is what P1 removes.
+     */
+    private fun flattenCrossKv(crossInputs: Map<String, OnnxTensor>, variant: WhisperVariant): ShortArray {
+        val perTensor = variant.kvShape(true, 1500).fold(1L) { a, b -> a * b }.toInt()
+        val flat = ShortArray(perTensor * crossNames.size)
+        var offset = 0
+        for (name in crossNames) {
+            val tensor = crossInputs[name] ?: error("missing cross-KV tensor $name")
+            val buffer = tensor.getShortBuffer().duplicate()
+            check(buffer.remaining() == perTensor) { "$name elements=${buffer.remaining()} expected=$perTensor" }
+            buffer.get(flat, offset, perTensor)
+            offset += perTensor
+        }
+        return flat
+    }
+
+    /** Bytes one flattened cross-KV window occupies, for logging. */
+    private fun flattenCrossKvBytes(variant: WhisperVariant): Int =
+        variant.kvShape(true, 1500).fold(1L) { a, b -> a * b }.toInt() * 2 * crossNames.size
+
+    /**
      * The graph appends the current token after 199 cache slots, then returns the
      * last 199 slots. Valid keys are on the right; unused leading slots are masked.
      */
-    private fun causalAttentionMask(env: OrtEnvironment, position: Int, owner: MutableList<OnnxTensor>): OnnxTensor {
-        val values = WhisperDecoderMask.forPosition(position)
+    private fun causalAttentionMask(env: OrtEnvironment, position: Int, owner: MutableList<OnnxTensor>): OnnxTensor {        val values = WhisperDecoderMask.forPosition(position)
         return OnnxTensor.createTensor(
             env,
             ShortBuffer.wrap(values),
@@ -781,7 +1019,31 @@ object QnnWhisperRealAudioRunner {
     }
 
     private fun halfStats(buffer: ShortBuffer): HalfStats { val c = buffer.duplicate(); var min = Float.POSITIVE_INFINITY; var max = Float.NEGATIVE_INFINITY; var sum = 0.0; var finite = 0; var nan = 0; var inf = 0; var nonZero = 0; while (c.hasRemaining()) { val v = halfToFloat(c.get().toInt() and 0xffff); when { v.isNaN() -> nan++; v.isInfinite() -> inf++; else -> { finite++; if (v < min) min = v; if (v > max) max = v; sum += v.toDouble(); if (v != 0f) nonZero++ } } }; return HalfStats(min, max, if (finite == 0) Double.NaN else sum / finite, finite, nan, inf, nonZero) }
-    private fun argmaxHalf(buffer: ShortBuffer, blocked: Set<Int> = emptySet()): Int { val c = buffer.duplicate(); var best = Float.NEGATIVE_INFINITY; var bestIndex = -1; var i = 0; while (c.hasRemaining()) { val v = halfToFloat(c.get().toInt() and 0xffff); if (v.isFinite() && v > best && i !in blocked) { best = v; bestIndex = i }; i++ }; return bestIndex }
+    /**
+     * Argmax over FP16 logits with an optional direct-index blocklist.
+     *
+     * The decode loop scans the full 51866-entry vocabulary once per generated token, so three
+     * things matter on device (the previous implementation measured 8.4 ms/step on SM8650): the
+     * logits are bulk-copied out of the direct buffer first (per-element `ShortBuffer.get()` on
+     * direct memory was several ms by itself), the FP16->FP32 decode is a table lookup instead of
+     * per-element exponent arithmetic, and the blocklist is a [BooleanArray] instead of a boxed
+     * `Set<Int>` probe per vocabulary entry.
+     */
+    private fun argmaxHalf(buffer: ShortBuffer, blocked: BooleanArray = EMPTY_BLOCKED): Int {
+        val c = buffer.duplicate()
+        val count = c.remaining()
+        val values = ShortArray(count)
+        c.get(values)
+        val table = HALF_TO_FLOAT
+        val limit = blocked.size
+        var best = Float.NEGATIVE_INFINITY
+        var bestIndex = -1
+        for (i in 0 until count) {
+            val v = table[values[i].toInt() and 0xffff]
+            if (v.isFinite() && v > best && (i >= limit || !blocked[i])) { best = v; bestIndex = i }
+        }
+        return bestIndex
+    }
     private fun halfAt(buffer: ShortBuffer, index: Int): Float { val c = buffer.duplicate(); c.position(index); return halfToFloat(c.get().toInt() and 0xffff) }
     private fun topKHalf(buffer: ShortBuffer, k: Int): List<Pair<Int, Float>> {
         val c = buffer.duplicate()
@@ -799,6 +1061,14 @@ object QnnWhisperRealAudioRunner {
     // Lookup tables: EXP_TABLE[e] = 2^(e-15) for normal exponents, SUBNORMAL_STEP = 2^-24.
     private val EXP_TABLE = FloatArray(32) { e -> if (e == 0) 0f else Math.pow(2.0, (e - 15).toDouble()).toFloat() }
     private val SUBNORMAL_STEP = Math.pow(2.0, -24.0).toFloat()
+
+    /**
+     * FP16 -> FP32 for all 65536 bit patterns. [halfToFloat] is a pure function of the 16-bit
+     * pattern, so the argmax scan can look its values up instead of redoing the sign/exponent/
+     * mantissa arithmetic for every one of the 51866 logits it visits per decoder step.
+     */
+    private val HALF_TO_FLOAT: FloatArray by lazy { FloatArray(1 shl 16) { bits -> halfToFloat(bits) } }
+    private val EMPTY_BLOCKED = BooleanArray(0)
     private fun createDiagnosticDir(context: Context): File {
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
         return File(context.filesDir, "diagnostics/experiment_$stamp").apply { mkdirs() }

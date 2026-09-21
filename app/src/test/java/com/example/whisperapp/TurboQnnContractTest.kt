@@ -122,4 +122,63 @@ class TurboQnnContractTest {
         assertEquals(128 * 3000, incremental.size)
         assertArrayEquals("incremental 128-bin mel must match the full extraction", full, incremental)
     }
+
+    /**
+     * The live path appends every 100 ms, not every second, and it does so ~300 times for a 30 s
+     * window. The normalization floor is a function of the max over the whole window, so it
+     * *changes* as audio arrives and every already-written frame can be clamped by it later.
+     *
+     * This is the regression guard for the mel-cache optimization: the cache now reuses scratch
+     * buffers and recomputes log10 into one of them instead of `rawMel.copyOf()`. If that reuse
+     * ever leaked stale values — or if a frame were skipped because its raw energy did not
+     * change while the floor did — the result would drift from the full extraction and this test
+     * would catch it. Small 100 ms chunks are used deliberately so the floor moves many times
+     * during the run.
+     */
+    @Test
+    fun incrementalCacheStaysBitIdenticalAcrossManySmallAppends() {
+        val extractor = WhisperTurboFeatureExtractor(WhisperMelConfig.LargeV3Turbo)
+        val cache = extractor.newIncrementalCache()
+        val chunkSamples = 1600 // 100 ms, matching the production read size
+        val chunks = 60          // 6 s of audio in 100 ms steps
+
+        val all = ShortArray(chunkSamples * chunks)
+        var last: ShortArray? = null
+        for (c in 0 until chunks) {
+            // Speech-like amplitude that ramps, so the window max keeps rising and the
+            // dynamic-range floor is recomputed differently on almost every append.
+            val chunk = ShortArray(chunkSamples) { i ->
+                val t = c * chunkSamples + i
+                (((t * 37) % 8000) - 4000 + (c * 20)).toShort()
+            }
+            chunk.copyInto(all, c * chunkSamples)
+            last = cache.append(chunk, 16_000)
+        }
+
+        val full = extractor.extractHalf(all, 16_000)
+        assertArrayEquals(
+            "incremental 128-bin mel must stay bit-identical across many small appends",
+            full,
+            last,
+        )
+    }
+
+    /**
+     * The returned array must not alias the cache's internal scratch buffer.
+     *
+     * The cache reuses its output buffer to avoid allocating 768 KB at 10 Hz. If that buffer
+     * escaped, the producer's next append would overwrite the window a consumer is still
+     * decoding — a silent corruption that would show up as wrong text, not as an exception.
+     * This asserts the *cache* contract (each returned array is independent); the live path
+     * additionally copies before publishing, see `LiveTranscriber.onAudioAppendedWithMel`.
+     */
+    @Test
+    fun incrementalCacheReturnsIndependentArrays() {
+        val cache = WhisperTurboFeatureExtractor(WhisperMelConfig.LargeV3Turbo).newIncrementalCache()
+        val first = cache.append(ShortArray(16_000) { ((it * 17) % 32767).toShort() }, 16_000)
+        val firstCopy = first.copyOf()
+        cache.append(ShortArray(16_000) { (((it + 31_000) * 13) % 32767).toShort() }, 16_000)
+        // The second append must not have mutated the array handed out by the first.
+        assertArrayEquals("a returned mel window must not be mutated by a later append", firstCopy, first)
+    }
 }

@@ -27,6 +27,11 @@ chat-build/
 tools/mel_host/mel_host
 tools/mel_host/mel_host_new
 
+# ONNX Runtime C API headers + link stub for the native decoder (P1), extracted from the
+# onnxruntime-android AAR. Headers and the 28 MB .so are build inputs, not sources:
+# regenerate with tools/fetch_ort_headers.ps1 (same version as the Gradle dependency).
+app/src/main/cpp/third_party/onnxruntime/lib/
+
 # Local debugging output: mel dumps, op traces, scratch build/test logs and traces.
 mel_good.bin
 mel_java.bin

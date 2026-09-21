@@ -11,6 +11,19 @@ object TraditionalChineseBlocklist {
     /** Set of token IDs that decode to text containing Traditional Chinese characters. */
     val blockedTokenIds: Set<Int> = setOf(2664, 2855, 3338, 3763, 4323, 4622, 4623, 5661, 5884, 6236, 6287, 6344, 6611, 7434, 7598, 7824, 8053, 8216, 8377, 8748, 8816, 8949, 8990, 10213, 10376, 10470, 11066, 11103, 11361, 11471, 11614, 13009, 13118, 13133, 14010, 14099, 14139, 14637, 14899, 14901, 15145, 15353, 15569, 15779, 16276, 16302, 16516, 16600, 16958, 16976, 17197, 17543, 17798, 17803, 17813, 18214, 18413, 18616, 18771, 18987, 19202, 19891, 19921, 20363, 20486, 20504, 20545, 20578, 20643, 20754, 20788, 21017, 21068, 21121, 21192, 21228, 21269, 21315, 21358, 21372, 21385, 21446, 21625, 21670, 21707, 21854, 22041, 22550, 22713, 22821, 23209, 23575, 23626, 23800, 23907, 23915, 23987, 24090, 24227, 24842, 25174, 25338, 25364, 25583, 25647, 25802, 25941, 26222, 26256, 26362, 26612, 26978, 27119, 27338, 27694, 27769, 28193, 28220, 29098, 29340, 29741, 29801, 29869, 30114, 30156, 30177, 30872, 30927, 30967, 31001, 31106, 31592, 31995, 32197, 32260, 32399, 32662, 32739, 32772, 32943, 33005, 33086, 33299, 33363, 33540, 33641, 33742, 33929, 34127, 34168, 34206, 34253, 34623, 34629, 34801, 35164, 35380, 35851, 35961, 36235, 36241, 36835, 36841, 36888, 36910, 36979, 37054, 37232, 37743, 37809, 37816, 38418, 38927, 39035, 39289, 39425, 39450, 39473, 39698, 40012, 40042, 40072, 40104, 40760, 40914, 41427, 42440, 42511, 42567, 42828, 42920, 43046, 43822, 44268, 44321, 44453, 45114, 45286, 45528, 45839, 45964, 46139, 46290, 46520, 46556, 46714, 46997, 47778, 47905, 48890, 49078, 49085, 49155, 49603, 49950, 50071)
 
+    /**
+     * Direct-index form of [blockedTokenIds] for the decode hot loop.
+     *
+     * [isBlocked] is called once per vocabulary entry per generated token (51866 x N). `Int` set
+     * membership boxes every probe and was measured at several ms per decoder step on SM8650, so
+     * the argmax path uses this array instead. Indices at or past [blockedMask].size are never
+     * blocked, which matches Set semantics for the unlisted token IDs.
+     */
+    val blockedMask: BooleanArray =
+        BooleanArray((blockedTokenIds.maxOrNull() ?: -1) + 1).also { mask ->
+            blockedTokenIds.forEach { id -> if (id in mask.indices) mask[id] = true }
+        }
+
     /** Check if a token ID should be blocked. */
     fun isBlocked(tokenId: Int): Boolean = tokenId in blockedTokenIds
 }

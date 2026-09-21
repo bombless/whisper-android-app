@@ -40,3 +40,36 @@ add_library(mel_native SHARED
 target_compile_features(mel_native PRIVATE cxx_std_17)
 target_compile_options(mel_native PRIVATE -O3 -fvisibility=hidden)
 target_link_libraries(mel_native PRIVATE log)
+
+# Native decoder step loop (P1): OrtSession + OrtIoBinding so the cross-KV tensors and the
+# attention mask stay in one bound buffer set instead of being rebuilt per decode step.
+# The ORT C++ headers and the link stub live in third_party/onnxruntime; regenerate them from
+# the onnxruntime-android AAR with `pwsh -File tools/fetch_ort_headers.ps1` (keep the version
+# in step with the Gradle dependency). libonnxruntime.so is already packaged into the APK by
+# that same AAR, so this links against it rather than vendoring a second runtime.
+add_library(whisper_decoder SHARED
+    whisper_decoder/whisper_decoder_jni.cpp
+)
+target_compile_features(whisper_decoder PRIVATE cxx_std_17)
+target_compile_options(whisper_decoder PRIVATE -O3 -fvisibility=hidden)
+
+set(ORT_ROOT ${CMAKE_CURRENT_LIST_DIR}/third_party/onnxruntime)
+if (NOT EXISTS ${ORT_ROOT}/onnxruntime_cxx_api.h)
+    message(FATAL_ERROR
+        "ONNX Runtime headers missing at ${ORT_ROOT}. "
+        "Run: pwsh -File tools/fetch_ort_headers.ps1")
+endif()
+target_include_directories(whisper_decoder PRIVATE ${ORT_ROOT})
+# Link against the onnxruntime shared library extracted from the onnxruntime-android AAR.
+# It is the exact build that AAR already packages into the APK, so linking against it adds no
+# second runtime and no version skew; the JNI lib only needs its symbols resolved at link
+# time and gets the real .so from the APK at run time.
+set(ORT_LIB ${ORT_ROOT}/lib/${ANDROID_ABI}/libonnxruntime.so)
+if (NOT EXISTS ${ORT_LIB})
+    message(FATAL_ERROR
+        "ONNX Runtime link stub missing at ${ORT_LIB}. "
+        "Run: pwsh -File tools/fetch_ort_headers.ps1 -Abi ${ANDROID_ABI}")
+endif()
+add_library(onnxruntime SHARED IMPORTED)
+set_target_properties(onnxruntime PROPERTIES IMPORTED_LOCATION ${ORT_LIB})
+target_link_libraries(whisper_decoder PRIVATE log onnxruntime)
