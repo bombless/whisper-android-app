@@ -395,7 +395,7 @@ fun MainScreen() {
                             colors = ButtonDefaults.buttonColors(containerColor = if (recording) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary)
                         ) { Text(if (recording) "停止转录" else "开始说话") }
                         Spacer(Modifier.height(8.dp))
-                        Text("${sttVariant.displayName} · 16 kHz · 每 5 秒更新一次", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelMedium)
+                        Text("${sttVariant.displayName} · 16 kHz", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelMedium)
                     }
                 }
             } else {
