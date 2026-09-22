@@ -4,6 +4,7 @@ import android.util.Log
 import com.example.whisperapp.asr.WhisperVariant
 import com.example.whisperapp.qnn.QnnWhisperRealAudioRunner
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.isActive
@@ -217,7 +218,7 @@ class LiveTranscriber(
     fun start(): Job {
         consumerJob?.cancel()
         melJob?.cancel()
-        val melWorker = scope.launch {
+        val melWorker = scope.launch(Dispatchers.Default) {
             for (chunk in melInput) {
                 // Runs in capture order on its own coroutine, so a slow mel pass can never
                 // block the microphone read the way it used to.
@@ -227,7 +228,7 @@ class LiveTranscriber(
             }
         }
         melJob = melWorker
-        val job = scope.launch {
+        val job = scope.launch(Dispatchers.Default) {
             while (isActive) {
                 wake.receive()
                 // Drain any further signals that arrived while we were idle, then take a
@@ -305,7 +306,7 @@ class LiveTranscriber(
      * performs it before shutting down.
      */
     fun requestFinal(): Job? {
-        val job = scope.launch { runOnce(decide(forceFinal = true)) }
+        val job = scope.launch(Dispatchers.Default) { runOnce(decide(forceFinal = true)) }
         return job
     }
 

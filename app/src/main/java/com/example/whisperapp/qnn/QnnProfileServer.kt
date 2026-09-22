@@ -25,7 +25,17 @@ class QnnProfileServer(private val root: File, private val port: Int = 8765) {
     fun start() {
         if (running) return
         root.mkdirs()
-        server = ServerSocket(port, 16, InetAddress.getByName("127.0.0.1"))
+        try {
+            server = ServerSocket(port, 16, InetAddress.getByName("127.0.0.1"))
+        } catch (e: BindException) {
+            // The profile dashboard is diagnostic-only. A stale process, another app instance,
+            // or an existing adb-forwarded server may already own 8765. Never let that prevent
+            // the Whisper QNN session from starting; simply disable this optional endpoint.
+            server = null
+            running = false
+            Log.w(tag, "DISABLED port=$port already in use; STT startup will continue", e)
+            return
+        }
         running = true
         pool.execute { acceptLoop() }
         Log.i(tag, "LISTEN 127.0.0.1:$port")

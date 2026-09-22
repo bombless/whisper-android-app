@@ -15,8 +15,8 @@ import java.nio.LongBuffer
 object QnnLfm2ChatRunner {
     private const val TAG = "QNN_LFM2"
     private const val EP = "QNNExecutionProvider"
-    private const val MODEL_ASSET = "chat/models/LFM2.5-230M-ONNX/onnx/model_q4.onnx"
-    private const val DATA_PREFIX = "chat/models/LFM2.5-230M-ONNX/onnx/model_q4.onnx_data.part"
+    private const val MODEL_DIR = "LFM2.5-230M-ONNX/onnx"
+    private const val MODEL_FILE = "model_q4.onnx"
     /**
      * Name the graph itself declares for its external data (`external_data.location` of every
      * external initializer). ORT resolves it relative to the model file, so the concatenated
@@ -37,8 +37,11 @@ object QnnLfm2ChatRunner {
     fun start(context: Context): Status = synchronized(lock) {
         try {
             val app = context.applicationContext
-            val model = copyAsset(app, MODEL_ASSET)
-            copyExternalData(app, model.parentFile ?: app.cacheDir)
+            val modelDir = File(app.getExternalFilesDir("models") ?: app.filesDir, MODEL_DIR)
+            val model = File(modelDir, MODEL_FILE)
+            val data = File(modelDir, EXTERNAL_DATA_NAME)
+            check(model.isFile) { "LFM2.5 Q4 模型未安装：" + model.absolutePath }
+            check(data.isFile) { "LFM2.5 Q4 权重未安装：" + data.absolutePath }
             if (env == null) env = OrtEnvironment.getEnvironment(OrtLoggingLevel.ORT_LOGGING_LEVEL_WARNING, TAG)
             // The environment (and therefore the QNN EP registration) is shared with the Whisper
             // ASR runner, which keeps its registration alive after recording stops; the gate below
@@ -199,28 +202,4 @@ object QnnLfm2ChatRunner {
     private fun floatTensor(data: FloatArray, shape: LongArray, owned: MutableList<OnnxTensor>) =
         OnnxTensor.createTensor(env!!, FloatBuffer.wrap(data), shape).also { owned += it }
 
-    private fun copyAsset(context: Context, asset: String, dir: File = context.cacheDir): File {
-        val target = File(dir, asset.substringAfterLast('/'))
-        context.assets.open(asset).use { input ->
-            val size = input.available().toLong()
-            if (!target.isFile || target.length() != size) {
-                target.outputStream().use { input.copyTo(it) }
-            }
-        }
-        return target
-    }
-
-    private fun copyExternalData(context: Context, dir: File): File {
-        val target = File(dir, EXTERNAL_DATA_NAME)
-        val assetDir = DATA_PREFIX.substringBeforeLast('/')
-        val prefix = DATA_PREFIX.substringAfterLast('/')
-        val names = context.assets.list(assetDir)?.filter { it.startsWith(prefix) }?.sorted() ?: emptyList()
-        check(names.isNotEmpty()) { "Missing LFM2 external-data chunks" }
-        val expected = names.sumOf { name -> context.assets.open("$assetDir/$name").use { it.available().toLong() } }
-        if (target.isFile && target.length() == expected) return target
-        target.outputStream().use { out ->
-            for (name in names) context.assets.open("$assetDir/$name").use { it.copyTo(out, 1024 * 1024) }
-        }
-        return target
-    }
 }
