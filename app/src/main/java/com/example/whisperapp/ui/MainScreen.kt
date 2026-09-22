@@ -183,8 +183,11 @@ fun MainScreen() {
         status = "正在监听…"
         recordingJob = scope.launch(Dispatchers.IO) {
             recordingLifecycleMutex.withLock {
-            val rate = 16_000
-            val samplesPerUpdate = rate
+            val rate = WhisperFeatureExtractor.SAMPLE_RATE
+            // Keep Whisper capture at 16 kHz. Read small PCM chunks; LiveTranscriber
+            // independently triggers inference every 2 seconds.
+            val readSamples = rate / 10 // 100 ms = 1,600 samples
+            val triggerSamples = rate * 2 // 2 s = 32,000 samples
             val maxContextSamples = WhisperFeatureExtractor.CHUNK_SAMPLES
             val minBuffer = AudioRecord.getMinBufferSize(rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
             if (minBuffer <= 0) {
@@ -192,7 +195,7 @@ fun MainScreen() {
                 return@launch
             }
             var recorder: AudioRecord? = null
-            val readBuffer = ShortArray(samplesPerUpdate)
+            val readBuffer = ShortArray(readSamples)
             var updateId = 0
             var cumulativeSamples = 0L
             var lastUpdateCompletedNs = 0L
@@ -200,13 +203,13 @@ fun MainScreen() {
             var consumerJob: Job? = null
             try {
                 QnnWhisperRealAudioRunner.start(context, sttVariant)
-                recorder = AudioRecord(MediaRecorder.AudioSource.MIC, rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, maxOf(minBuffer, samplesPerUpdate * 4))
+                recorder = AudioRecord(MediaRecorder.AudioSource.MIC, rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, maxOf(minBuffer, readSamples * 4))
                 check(recorder?.state == AudioRecord.STATE_INITIALIZED) { "麦克风初始化失败" }
                 val activeRecorder = recorder ?: error("麦克风录音器未初始化")
                 Log.i("WHISPER_DIAG", "QNN_SESSION_READY")
                 activeRecorder.startRecording()
                 check(activeRecorder.recordingState == AudioRecord.RECORDSTATE_RECORDING) { "麦克风未进入录音状态" }
-                Log.i("WHISPER_DIAG", "AUDIO_RECORD_STARTED state=" + activeRecorder.recordingState + " minBuffer=" + minBuffer + " updateSamples=" + samplesPerUpdate)
+                Log.i("WHISPER_DIAG", "AUDIO_RECORD_STARTED state=" + activeRecorder.recordingState + " minBuffer=" + minBuffer + " readSamples=" + readSamples + " triggerSamples=" + triggerSamples)
 
                 // P0-1: capture and inference are separate coroutines. This loop only reads
                 // the microphone and appends to the ring + mel window; inference runs on its
@@ -216,6 +219,7 @@ fun MainScreen() {
                     context = context.applicationContext,
                     scope = scope,
                     variant = sttVariant,
+                    triggerSamples = triggerSamples,
                     melCache = whisperMelCache,
                     onResult = { result ->
                         scope.launch(Dispatchers.Main) {
@@ -238,20 +242,20 @@ fun MainScreen() {
                 consumerJob = live.start()
 
                 while (kotlinx.coroutines.currentCoroutineContext().isActive) {
-                    val n = activeRecorder.read(readBuffer, 0, samplesPerUpdate)
+                    val n = activeRecorder.read(readBuffer, 0, readSamples)
                     if (n <= 0) {
                         Log.w("WHISPER_DIAG", "AUDIO_READ_ERROR n=$n state=${recorder.recordingState}")
-                        Log.w("WHISPER_DEBUG", "AUDIO_READ_ERROR requestedSamples=$samplesPerUpdate actualSamples=$n cumulativeSamples=$cumulativeSamples")
+                        Log.w("WHISPER_DEBUG", "AUDIO_READ_ERROR requestedSamples=$readSamples actualSamples=$n cumulativeSamples=$cumulativeSamples")
                         continue
                     }
-                    val chunk = if (n == samplesPerUpdate) readBuffer else readBuffer.copyOf(n)
+                    val chunk = if (n == readSamples) readBuffer else readBuffer.copyOf(n)
                     // Feed the ring and the incremental mel window in capture order. Both are
                     // cheap memory writes; neither can block on inference.
                     val melHalf = live.onAudioAppendedWithMel(chunk)
                     cumulativeSamples += n
-                    Log.i("WHISPER_DEBUG", "AUDIO readRequested=$samplesPerUpdate readActual=$n cumulative=$cumulativeSamples audioSec=${cumulativeSamples / rate.toDouble()}")
+                    Log.i("WHISPER_DEBUG", "AUDIO readRequested=$readSamples readActual=$n cumulative=$cumulativeSamples audioSec=${cumulativeSamples / rate.toDouble()}")
 
-                    if (melHalf != null && cumulativeSamples >= samplesPerUpdate) {
+                    if (melHalf != null && cumulativeSamples >= triggerSamples) {
                         updateId++
                         val audioIntervalMs = if (lastUpdateCompletedNs == 0L) 0.0 else (System.nanoTime() - lastUpdateCompletedNs) / 1_000_000.0
                         Log.i("WHISPER_DEBUG", "UPDATE #$updateId cumulativeSamples=$cumulativeSamples audioSec=${cumulativeSamples / rate.toDouble()} audioIntervalMs=$audioIntervalMs melCached=true")
@@ -304,7 +308,7 @@ fun MainScreen() {
                 .windowInsetsPadding(WindowInsets.safeDrawing)
                 .padding(horizontal = 20.dp)
         ) {
-            TabRow(selectedTabIndex = selectedTab) {
+            TabRow(selectedTabIndex = selectedTab, modifier = Modifier.padding(0.dp)) {
                 Tab(selected = selectedTab == 0, onClick = { switchToTab(0) }, text = { Text("文字转语音") })
                 Tab(selected = selectedTab == 1, onClick = { switchToTab(1) }, text = { Text("语音转文字") })
                 Tab(selected = selectedTab == 2, onClick = { switchToTab(2) }, text = { Text("聊天") })

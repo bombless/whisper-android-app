@@ -204,7 +204,11 @@ class WhisperFeatureExtractor : WhisperMelFrontend {
 
         private fun recomputeAffectedFrames(oldSamples: Int, newSamples: Int) {
             val centerPad = N_FFT / 2
-            val firstFrame = max(0, oldSamples - (N_FFT - centerPad - 1) + HOP_LENGTH - 1) / HOP_LENGTH
+            // A frame is affected whenever its 400-sample analysis window can overlap
+            // newly appended PCM.  Include the frame immediately before the nominal
+            // boundary as well; integer rounding in the old expression could leave the
+            // boundary frame stale by one frame for some append sizes.
+            val firstFrame = max(0, (oldSamples - N_FFT + HOP_LENGTH - 1) / HOP_LENGTH)
             val lastFrame = min(N_FRAMES - 1, (newSamples - 1 + centerPad) / HOP_LENGTH)
             if (firstFrame > lastFrame) return
             for (frame in firstFrame..lastFrame) {

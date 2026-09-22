@@ -1128,8 +1128,21 @@ object QnnWhisperRealAudioRunner {
         // Each variant keeps its own directory: Tiny and Turbo both ship files named
         // encoder.bin / decoder.bin / *_ctx.onnx, and an EPContext wrapper resolves its
         // relative ep_cache_context against the wrapper's own directory.
-        val dir = File(context.cacheDir, "whisper-${variant.name.lowercase()}").apply { mkdirs() }
+        val dir = if (variant == WhisperVariant.LARGE_V3_TURBO) {
+            File(context.getExternalFilesDir(null), "whisper_large_v3_turbo").apply { mkdirs() }
+        } else {
+            File(context.cacheDir, "whisper-${variant.name.lowercase()}").apply { mkdirs() }
+        }
         val f = File(dir, asset.substringAfterLast('/'))
+        if (variant == WhisperVariant.LARGE_V3_TURBO &&
+            (asset.endsWith("/encoder.bin") || asset.endsWith("/decoder.bin"))
+        ) {
+            check(f.isFile && f.length() > 0) {
+                "Missing external Turbo model binary: ${f.absolutePath}. " +
+                    "Push encoder.bin and decoder.bin there with adb before starting STT."
+            }
+            return f
+        }
         // Context binaries are immutable; skip the copy when a same-size file already exists.
         // (Re-copying the ~2.2 GB of Turbo binaries per chunk would dominate every update.)
         val size = assetLength(context, asset)
