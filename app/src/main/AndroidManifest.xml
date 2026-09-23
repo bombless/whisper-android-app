@@ -8,13 +8,13 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.WhisperApp">
         <uses-native-library android:name="libcdsprpc.so" android:required="false" />
-        <activity android:name=".qnn.QnnSmokeActivity" android:exported="true" />
-        <activity android:name=".qnn.M35RealAudioEncoderActivity" android:exported="true" />
-        <activity android:name=".qnn.M35RealAudioDecoderActivity" android:exported="true" />
-        <activity android:name=".qnn.LongAudioVerificationActivity" android:exported="true" />
-        <activity android:name=".qnn.P0LoopbackVerificationActivity" android:exported="true" />
-        <activity android:name=".qnn.WhisperReferenceActivity" android:exported="true" />
-        <activity android:name=".qnn.WhisperEncoderDiagnosticActivity" android:exported="true" />
+        <activity android:name=".qnn.QnnSmokeActivity" android:exported="true" android:screenOrientation="portrait" />
+        <activity android:name=".qnn.M35RealAudioEncoderActivity" android:exported="true" android:screenOrientation="portrait" />
+        <activity android:name=".qnn.M35RealAudioDecoderActivity" android:exported="true" android:screenOrientation="portrait" />
+        <activity android:name=".qnn.LongAudioVerificationActivity" android:exported="true" android:screenOrientation="portrait" />
+        <activity android:name=".qnn.P0LoopbackVerificationActivity" android:exported="true" android:screenOrientation="portrait" />
+        <activity android:name=".qnn.WhisperReferenceActivity" android:exported="true" android:screenOrientation="portrait" />
+        <activity android:name=".qnn.WhisperEncoderDiagnosticActivity" android:exported="true" android:screenOrientation="portrait" />
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"
@@ -22,7 +22,7 @@
             android:grantUriPermissions="true">
             <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/file_paths" />
         </provider>
-        <activity android:name=".MainActivity" android:exported="true">
+        <activity android:name=".MainActivity" android:exported="true" android:screenOrientation="portrait">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
