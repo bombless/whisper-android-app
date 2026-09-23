@@ -37,7 +37,7 @@ object QnnLfm2ChatRunner {
     fun start(context: Context): Status = synchronized(lock) {
         try {
             val app = context.applicationContext
-            val modelDir = File(app.getExternalFilesDir("models") ?: app.filesDir, MODEL_DIR)
+            val modelDir = File(app.filesDir, "models/$MODEL_DIR")
             val model = File(modelDir, MODEL_FILE)
             val data = File(modelDir, EXTERNAL_DATA_NAME)
             check(model.isFile) { "LFM2.5 Q4 模型未安装：" + model.absolutePath }

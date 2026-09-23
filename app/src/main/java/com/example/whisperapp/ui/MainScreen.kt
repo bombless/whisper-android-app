@@ -47,6 +47,11 @@ import androidx.compose.runtime.LaunchedEffect
 fun MainScreen() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    var showConfig by remember { mutableStateOf(false) }
+    if (showConfig) {
+        ConfigScreen(onBack = { showConfig = false })
+        return
+    }
     var selectedTab by remember { mutableIntStateOf(0) }
     var ttsText by remember { mutableStateOf("") }
     var ttsStatus by remember { mutableStateOf("TTS 就绪") }
@@ -309,8 +314,8 @@ fun MainScreen() {
                 .padding(horizontal = 20.dp)
         ) {
             TabRow(selectedTabIndex = selectedTab, modifier = Modifier.padding(0.dp)) {
-                Tab(selected = selectedTab == 0, onClick = { switchToTab(0) }, text = { Text("文字转语音") })
-                Tab(selected = selectedTab == 1, onClick = { switchToTab(1) }, text = { Text("语音转文字") })
+                Tab(selected = selectedTab == 0, onClick = { switchToTab(0) }, text = { Text("文生语音") })
+                Tab(selected = selectedTab == 1, onClick = { switchToTab(1) }, text = { Text("语音生文") })
                 Tab(selected = selectedTab == 2, onClick = { switchToTab(2) }, text = { Text("聊天") })
             }
             Spacer(Modifier.height(20.dp))
@@ -405,6 +410,9 @@ fun MainScreen() {
             } else {
                 ChatScreen(Modifier.fillMaxSize())
             }
+            }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Start) {
+                TextButton(onClick = { showConfig = true }) { Text("⚙ 配置") }
             }
         }
     }
