@@ -29,6 +29,23 @@ fun ChatScreen(modifier: Modifier = Modifier) {
 
     DisposableEffect(Unit) { onDispose { QnnLfm2ChatRunner.stop() } }
 
+    val send: () -> Unit = {
+        if (!busy && input.isNotBlank() && status.contains("已就绪")) {
+            val text = input.trim(); input = ""; messages += "user" to text; busy = true
+            val historySnapshot = messages.toList()
+            Log.i("CHAT_UI", "SEND chars=${text.length} text=${text.take(200)} history=${historySnapshot.size}")
+            scope.launch(Dispatchers.Default) {
+                Log.i("CHAT_UI", "GENERATE_DISPATCH thread=${Thread.currentThread().name}")
+                val answer = runCatching {
+                    QnnLfm2ChatRunner.generate(context, historySnapshot)
+                }.onFailure { Log.e("CHAT_UI", "GENERATE_FAILED type=${it::class.java.name} message=${it.message}", it) }
+                    .getOrElse { "生成失败：${it.message}" }
+                Log.i("CHAT_UI", "GENERATE_RETURN chars=${answer.length} answer=${answer.take(500)}")
+                launch(Dispatchers.Main) { messages += "assistant" to answer; busy = false }
+            }
+        }
+    }
+
     Column(modifier.fillMaxSize().padding(14.dp)) {
         Text(status, style = MaterialTheme.typography.labelMedium)
         Spacer(Modifier.height(8.dp))
@@ -40,21 +57,10 @@ fun ChatScreen(modifier: Modifier = Modifier) {
             }
         }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedTextField(value = input, onValueChange = { input = it }, enabled = !busy, modifier = Modifier.weight(1f), placeholder = { Text("输入消息…") })
-            Button(enabled = !busy && input.isNotBlank() && status.contains("已就绪"), onClick = {
-                val text = input.trim(); input = ""; messages += "user" to text; busy = true
-                val historySnapshot = messages.toList()
-                Log.i("CHAT_UI", "SEND_CLICK chars=${text.length} text=${text.take(200)} history=${historySnapshot.size}")
-                scope.launch(Dispatchers.Default) {
-                    Log.i("CHAT_UI", "GENERATE_DISPATCH thread=${Thread.currentThread().name}")
-                    val answer = runCatching {
-                        QnnLfm2ChatRunner.generate(context, historySnapshot)
-                    }.onFailure { Log.e("CHAT_UI", "GENERATE_FAILED type=${it::class.java.name} message=${it.message}", it) }
-                        .getOrElse { "生成失败：${it.message}" }
-                    Log.i("CHAT_UI", "GENERATE_RETURN chars=${answer.length} answer=${answer.take(500)}")
-                    launch(Dispatchers.Main) { messages += "assistant" to answer; busy = false }
-                }
-            }) { Text("发送") }
+            OutlinedTextField(value = input, onValueChange = { input = it }, enabled = !busy, modifier = Modifier.weight(1f), placeholder = { Text("输入消息…") },
+                keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(imeAction = androidx.compose.ui.text.input.ImeAction.Send),
+                keyboardActions = androidx.compose.foundation.text.KeyboardActions(onSend = { send() }))
+            Button(enabled = !busy && input.isNotBlank() && status.contains("已就绪"), onClick = send) { Text("发送") }
         }
     }
 }
