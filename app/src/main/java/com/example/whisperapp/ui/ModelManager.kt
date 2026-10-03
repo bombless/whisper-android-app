@@ -36,6 +36,7 @@ data class ModelStatus(
 }
 
 object ModelManager {
+    private const val LFM2_Q4_DATA_SIZE = 211_111_936L
     private const val RAW_BASE =
         "https://raw.atomgit.com/bombless/android-multimodal-onnx-htp/raw/master/assets/models"
     private const val LFM2_MODEL_DIR = "models/LFM2.5-230M-ONNX"
@@ -49,7 +50,7 @@ object ModelManager {
 
     private val lfm2Files = listOf(
         "onnx/model_q4.onnx",
-        "onnx/model_q4f32.onnx_data",
+        "onnx/model_q4.onnx_data",
     )
     private val whisperFiles = listOf(
         "encoder.bin",
@@ -78,6 +79,19 @@ object ModelManager {
         }.apply { mkdirs() }
 
     fun status(context: Context, model: ManagedModel): ModelStatus {
+        if (model == ManagedModel.LFM2) {
+            // model_q4.onnx and model_q4f32.onnx are different quantizations and their
+            // external data files are not interchangeable. Older builds may have renamed
+            // the 403 MB q4f32 weights to the q4 filename; remove that invalid file so the
+            // correctly sized q4 weights can be downloaded.
+            val dir = modelDir(context, model)
+            val expected = File(dir, "onnx/model_q4.onnx_data")
+            if (expected.isFile && expected.length() != LFM2_Q4_DATA_SIZE) {
+                check(expected.delete()) {
+                    "无法删除不匹配的 LFM2 Q4 权重：${expected.absolutePath}"
+                }
+            }
+        }
         val files = if (model == ManagedModel.LFM2) {
             lfm2Files.map { path ->
                 ModelFileStatus(
