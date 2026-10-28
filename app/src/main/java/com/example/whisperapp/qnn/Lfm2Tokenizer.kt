@@ -2,15 +2,17 @@ package com.example.whisperapp.qnn
 
 import android.content.res.AssetManager
 import org.json.JSONObject
+import java.io.File
+import java.io.InputStream
 import java.util.Locale
 import java.util.regex.Pattern
 
 /**
- * Small offline byte-level BPE tokenizer for LFM2.5.
+ * Small offline byte-level BPE tokenizer for LFM3.
  * It intentionally reads the Hugging Face tokenizer.json shipped with the app;
  * no JavaScript/WebView runtime is involved.
  */
-class Lfm2Tokenizer private constructor(
+class LfmTokenizer private constructor(
     private val vocab: Map<String, Int>,
     private val merges: Map<Pair<String, String>, Int>,
     private val special: Map<String, Int>,
@@ -81,7 +83,7 @@ class Lfm2Tokenizer private constructor(
         val inverse = inverseVocab
         val bytes = ArrayList<Byte>()
         for (id in ids) {
-            if (id == EOS_ID || id < 0) continue
+            if (id == EOS_ID || id == BOS_ID || id < 0) continue
             val token = inverse[id] ?: continue
             for (ch in token) bytes += byteDecoder[ch]?.toByte() ?: continue
         }
@@ -92,13 +94,26 @@ class Lfm2Tokenizer private constructor(
 
     fun specialId(token: String): Int = special[token] ?: vocab[token] ?: error("Missing special token $token")
 
-    private val inverseVocab: Map<Int, String> by lazy { vocab.entries.associate { it.value to it.key } }
+    private val inverseVocab: Map<Int, String> by lazy {
+        vocab.entries.associate { it.value to it.key } + special.entries.associate { it.value to it.key }
+    }
     private val byteDecoder: Map<Char, Int> by lazy { byteEncoder.entries.associate { it.value to it.key } }
 
     companion object {
-        const val EOS_ID = 7
-        fun fromAssets(assets: AssetManager, base: String = "chat/models/LFM2.5-230M-ONNX/tokenizer.json"): Lfm2Tokenizer {
-            val root = JSONObject(assets.open(base).bufferedReader().use { it.readText() })
+        const val BOS_ID = 124894
+        const val EOS_ID = 124900
+
+        fun fromAssets(assets: AssetManager, base: String = "chat/models/LFM3-1.7B-ONNX/tokenizer.json"): LfmTokenizer {
+            return fromInputStream(assets.open(base))
+        }
+
+        fun fromFile(file: File): LfmTokenizer {
+            return fromInputStream(file.inputStream())
+        }
+
+        fun fromInputStream(stream: InputStream): LfmTokenizer {
+            val text = stream.bufferedReader().use { it.readText() }
+            val root = JSONObject(text)
             val model = root.getJSONObject("model")
             val vocabJson = model.getJSONObject("vocab")
             val vocab = HashMap<String, Int>(vocabJson.length())
@@ -120,7 +135,7 @@ class Lfm2Tokenizer private constructor(
                 val o = added.getJSONObject(i)
                 special[o.getString("content")] = o.getInt("id")
             }
-            return Lfm2Tokenizer(vocab, mergeMap, special)
+            return LfmTokenizer(vocab, mergeMap, special)
         }
 
         private fun buildByteEncoder(): Map<Int, Char> {
@@ -135,3 +150,5 @@ class Lfm2Tokenizer private constructor(
         }
     }
 }
+
+typealias Lfm2Tokenizer = LfmTokenizer

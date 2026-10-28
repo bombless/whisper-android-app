@@ -93,7 +93,7 @@ fun ConfigScreen(onBack: () -> Unit) {
             Spacer(Modifier.height(8.dp))
             Text("模型", style = MaterialTheme.typography.titleLarge)
             Text(
-                "管理本地运行所需的 LFM2.5 230M 和 Whisper Large v3 模型文件。",
+                "管理本地运行所需的 LFM3 1.7B 和 Whisper Large v3 模型文件。",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )

@@ -10,8 +10,12 @@ import java.net.URL
 import java.util.zip.ZipInputStream
 
 enum class ManagedModel(val title: String) {
-    LFM2("LFM2.5 230M"),
-    WHISPER_LARGE_V3("Whisper Large v3"),
+    LFM3("LFM3 1.7B"),
+    WHISPER_LARGE_V3("Whisper Large v3");
+
+    companion object {
+        val LFM2: ManagedModel get() = LFM3
+    }
 }
 
 data class ModelFileStatus(
@@ -36,11 +40,12 @@ data class ModelStatus(
 }
 
 object ModelManager {
-    private const val LFM2_Q4_DATA_SIZE = 211_111_936L
-    private const val RAW_BASE =
-        "https://raw.atomgit.com/bombless/android-multimodal-onnx-htp/raw/master/assets/models"
-    private const val LFM2_MODEL_DIR = "models/LFM2.5-230M-ONNX"
-    private const val LFM2_MODEL_ROOT = "LFM2.5-230M-ONNX"
+    private const val LFM3_Q4_DATA_SIZE = 1_625_944_064L
+    private const val LFM3_Q4_MODEL_SIZE = 352_630L
+    private const val LFM3_HF_BASE =
+        "https://huggingface.co/LiquidAI/LFM3-1.7B-ONNX/resolve/main"
+    private const val LFM3_MODEL_DIR = "models/LFM3-1.7B-ONNX"
+    private const val LFM3_MODEL_ROOT = "LFM3-1.7B-ONNX"
     private const val TURBO_ASSET_URL =
         "https://qaihub-public-assets.s3.us-west-2.amazonaws.com/qai-hub-models/models/" +
             "whisper_large_v3_turbo/releases/v0.62.2/" +
@@ -48,9 +53,13 @@ object ModelManager {
     private const val TOKENIZER_BASE =
         "https://huggingface.co/openai/whisper-large-v3-turbo/resolve/main/"
 
-    private val lfm2Files = listOf(
+    private val lfm3Files = listOf(
         "onnx/model_q4.onnx",
         "onnx/model_q4.onnx_data",
+    )
+    private val lfm3BinarySizes = mapOf(
+        "onnx/model_q4.onnx" to LFM3_Q4_MODEL_SIZE,
+        "onnx/model_q4.onnx_data" to LFM3_Q4_DATA_SIZE,
     )
     private val whisperFiles = listOf(
         "encoder.bin",
@@ -69,8 +78,8 @@ object ModelManager {
     )
 
     fun modelDir(context: Context, model: ManagedModel): File =
-        if (model == ManagedModel.LFM2) {
-            File(context.filesDir, LFM2_MODEL_DIR)
+        if (model == ManagedModel.LFM3) {
+            File(context.filesDir, LFM3_MODEL_DIR)
         } else {
             File(
                 context.getExternalFilesDir(null) ?: context.filesDir,
@@ -79,27 +88,24 @@ object ModelManager {
         }.apply { mkdirs() }
 
     fun status(context: Context, model: ManagedModel): ModelStatus {
-        if (model == ManagedModel.LFM2) {
-            // model_q4.onnx and model_q4f32.onnx are different quantizations and their
-            // external data files are not interchangeable. Older builds may have renamed
-            // the 403 MB q4f32 weights to the q4 filename; remove that invalid file so the
-            // correctly sized q4 weights can be downloaded.
+        if (model == ManagedModel.LFM3) {
             val dir = modelDir(context, model)
             val expected = File(dir, "onnx/model_q4.onnx_data")
-            if (expected.isFile && expected.length() != LFM2_Q4_DATA_SIZE) {
+            if (expected.isFile && expected.length() != LFM3_Q4_DATA_SIZE) {
                 check(expected.delete()) {
-                    "无法删除不匹配的 LFM2 Q4 权重：${expected.absolutePath}"
+                    "无法删除不匹配的 LFM3 Q4 权重：${expected.absolutePath}"
                 }
             }
         }
-        val files = if (model == ManagedModel.LFM2) {
-            lfm2Files.map { path ->
+        val files = if (model == ManagedModel.LFM3) {
+            lfm3Files.map { path ->
                 ModelFileStatus(
                     model = model,
                     path = path,
                     bundled = false,
                     localFile = File(modelDir(context, model), path),
-                    downloadUrl = RAW_BASE + "/" + LFM2_MODEL_ROOT + "/" + path,
+                    downloadUrl = LFM3_HF_BASE + "/" + path,
+                    expectedSize = lfm3BinarySizes[path],
                 )
             }
         } else {

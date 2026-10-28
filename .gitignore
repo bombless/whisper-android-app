@@ -14,10 +14,12 @@ local.properties
 #  - the Tiny set and the TTS models live in the `lib` submodule (lib/assets/models/...)
 #  - the Whisper-Large-V3-Turbo QNN set is ~2.2 GB, far over GitHub's 100 MB per-file
 #    limit; reconstruct it with tools/fetch_turbo_assets.py
-#  - the LFM2 chat payload is ~0.4 GB
+#  - the LFM chat payload
 app/src/main/assets/models/
 app/src/main/assets/chat/
 LFM2.5-230M-ONNX/
+LFM3-1.7B/
+LFM3-1.7B-ONNX/
 
 # Working directory for downloading/repairing the Turbo asset archive.
 tools/whisper_large_v3_turbo_asset/
@@ -48,3 +50,7 @@ sym_log.txt
 test_log.txt
 test_run_stderr.txt
 test_run_stdout.txt
+.devpull/
+adb-ime-repro*
+screenshot_*.png
+w.html

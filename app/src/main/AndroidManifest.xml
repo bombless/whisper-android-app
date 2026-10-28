@@ -4,7 +4,9 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <application
         android:allowBackup="true"
-        android:label="Snapdragon Voice Lab"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="@string/app_name"
         android:supportsRtl="true"
         android:theme="@style/Theme.WhisperApp">
         <uses-native-library android:name="libcdsprpc.so" android:required="false" />
