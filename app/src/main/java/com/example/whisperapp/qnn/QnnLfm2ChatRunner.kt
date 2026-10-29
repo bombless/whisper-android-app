@@ -27,47 +27,72 @@ object QnnLfmChatRunner {
     private const val EXTERNAL_DATA_SIZE = 1_625_944_064L
     const val DEFAULT_MAX_TOKENS = 4096
     const val THINKING_PROMPT_PREFIX = "<think>让我把完整的方案想清楚再输出\n"
-    const val TOOL_SYSTEM_PROMPT = """你是一个具备代码运行和自我验证能力的 AI 助手。你可以调用内置的 JavaScript 运行时工具（run_javascript）来执行并验证代码，以确保算法实现、数学计算与复杂逻辑的绝对正确性。
+    const val TOOL_SYSTEM_PROMPT = """你是一个具备代码运行、网络请求与自主生图能力的 AI 助手。你可以自主调用以下内置工具来完成用户的需求：
 
-【工具定义】
-你可以调用如下工具：
-- 工具名称: run_javascript
-- 功能说明: 执行并验证 JavaScript (ES6) 脚本，支持 console.log() 与 assert(condition, message)。
-- 参数列表:
-  - code (string, 必需): 要执行的 JavaScript 代码。
+【工具定义列表】
+1. run_javascript:
+   - 功能说明: 执行并验证 JavaScript (ES6) 脚本，可用于算法实现、复杂数学计算与逻辑验证。
+   - 内置 API: 支持 console.log()、assert(condition, message)；支持通过 fetch(url, options) 或 httpGet(url) 发起 HTTPS/HTTP 网络请求并获取返回数据。
+   - 参数列表:
+     - code (string, 必需): 要执行的 JavaScript 脚本。
 
-【工具调用规范】
-当你需要验证算法（如红黑树、二叉树、图算法、排序、复杂数学计算等）时，请使用原生格式调用工具：
+2. generate_image:
+   - 功能说明: 调用本地 SDXL 神经加速引擎进行文生图，根据画面描述生成 1024x1024 高清图像。
+   - 参数列表:
+     - prompt (string, 必需): 详细的英文画面提示词（建议包含画面主体、艺术风格、光影、构图与细节）。
+     - negative_prompt (string, 可选): 负向提示词（默认 "blurry, low quality, distorted, bad anatomy"）。
+     - steps (number, 可选): 去噪步数（默认 20）。
+
+【工具调用格式规范】
+当你需要调用工具时，请使用官方原生格式：
 <tool_call>
-<function=run_javascript>
-<parameter=code>
-// 在此处编写合法的 JavaScript (ES6) 脚本
-// 可使用 console.log() 输出结果，可使用 assert(condition, message) 进行断言验证
+<function=工具名称>
+<parameter=参数名称>
+参数值内容
 </parameter>
 </function>
 </tool_call>
 
-系统会自动执行脚本并将控制台输出返回在 <tool_response> 中。你必须根据 <tool_response> 的测试结果输出最终正确方案。
+系统会自动执行该工具并将结果返回在 <tool_response> 中。你必须根据 <tool_response> 的结果给出最终回复。
 
-【调用示例 (One-Shot Example)】
-用户：请验证 1 + 1 是否等于 2。
+【调用示例 1: 代码与网络请求】
+用户：请查询指定仓库的信息。
 助手：
-让我调用 JavaScript 运行时来验证这个计算：
+让我调用 JavaScript 与网络请求来获取数据：
 <tool_call>
 <function=run_javascript>
 <parameter=code>
-const result = 1 + 1;
-console.log("计算结果:", result);
-assert(result === 2, "1 + 1 应该等于 2");
+const res = fetch("https://api.github.com/repos/ggerganov/llama.cpp");
+const data = res.json();
+console.log("仓库名:", data.name, "Stars:", data.stargazers_count);
 </parameter>
 </function>
 </tool_call>
 <tool_response>
 [输出]
-计算结果: 2
-[状态] 执行成功 (无输出)
+仓库名: llama.cpp Stars: 85000
 </tool_response>
-经过 JavaScript 运行时验证，计算结果 1 + 1 = 2，断言验证通过。"""
+查询成功，该仓库当前拥有超过 85,000 个 Stars。
+
+【调用示例 2: 本地 SDXL 生图】
+用户：帮我画一只戴着霓虹眼镜的赛博朋克猫咪。
+助手：
+好的，我将调用本地 SDXL 神经生图引擎为您生成图像：
+<tool_call>
+<function=generate_image>
+<parameter=prompt>
+a cute cyberpunk cat wearing glowing neon sunglasses, neon city background, night street, octane render, 8k, highly detailed
+</parameter>
+<parameter=negative_prompt>
+blurry, low quality, distorted
+</parameter>
+</function>
+</tool_call>
+<tool_response>
+[状态] 图像生成成功 (1024 × 1024)
+[图像路径] /data/user/0/com.example.whisperapp/files/generated_images/sdxl_sample.png
+</tool_response>
+已为您生成该赛博朋克猫咪插图！"""
     private val CONV_LAYERS = intArrayOf(0, 1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23)
     private val KV_LAYERS = intArrayOf(2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22)
     private const val CONV_CHANNELS = 2048
@@ -485,14 +510,55 @@ assert(result === 2, "1 + 1 应该等于 2");
                                 lastExecutedToolEnd = toolCall.endIndex
                                 LfmChatLogger.info("TOOL_CALL_DETECTED tool=${toolCall.name} codeChars=${toolCall.code.length} iteration=$toolExecutionCount")
 
-                                onToken?.invoke(lastDecodeText + "\n[⚙️ JavaScript 运行时正在执行并测试代码...]\n")
+                                val responseText: String
+                                if (toolCall.name.equals("generate_image", ignoreCase = true)) {
+                                    val prompt = toolCall.arguments["prompt"]?.takeIf { it.isNotBlank() } ?: toolCall.code
+                                    val negPrompt = toolCall.arguments["negative_prompt"]?.takeIf { it.isNotBlank() }
+                                        ?: "blurry, low quality, distorted, bad anatomy"
+                                    val steps = toolCall.arguments["steps"]?.toIntOrNull()?.coerceIn(5, 50) ?: 20
+                                    val seed = toolCall.arguments["seed"]?.toLongOrNull() ?: System.currentTimeMillis()
 
-                                val execResult = OpTrace.time("lfm.tool.exec", "tools") {
-                                    JsRuntime.execute(toolCall.code)
+                                    onToken?.invoke(lastDecodeText + "\n[🎨 本地 SDXL 神经生图引擎正在初始化…]\n")
+                                    val outputDir = File(context.filesDir, "generated_images").apply { mkdirs() }
+                                    val outputFile = File(outputDir, "sdxl_${System.currentTimeMillis()}.png")
+
+                                    val execResult = runCatching {
+                                        val bitmap = SdxlEngine.generate(context, prompt, negPrompt, steps, seed) { progressMsg ->
+                                            onToken?.invoke(lastDecodeText + "\n[🎨 SDXL 绘图进度: $progressMsg]\n")
+                                        }
+                                        outputFile.outputStream().use { out ->
+                                            bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, out)
+                                        }
+                                        outputFile
+                                    }
+
+                                    if (execResult.isSuccess) {
+                                        val savedFile = execResult.getOrThrow()
+                                        LfmChatLogger.info("SDXL_GENERATED_SUCCESS path=${savedFile.absolutePath} bytes=${savedFile.length()}")
+                                        responseText = LfmToolCallParser.formatImageToolResponse(
+                                            success = true,
+                                            filePath = savedFile.absolutePath,
+                                            prompt = prompt,
+                                            error = null
+                                        )
+                                    } else {
+                                        val err = execResult.exceptionOrNull()?.message ?: "未知错误"
+                                        LfmChatLogger.error("SDXL_GENERATED_FAILED: $err", execResult.exceptionOrNull())
+                                        responseText = LfmToolCallParser.formatImageToolResponse(
+                                            success = false,
+                                            filePath = null,
+                                            prompt = prompt,
+                                            error = err
+                                        )
+                                    }
+                                } else {
+                                    onToken?.invoke(lastDecodeText + "\n[⚙️ JavaScript 运行时正在执行并测试代码...]\n")
+                                    val execResult = OpTrace.time("lfm.tool.exec", "tools") {
+                                        JsRuntime.execute(toolCall.code)
+                                    }
+                                    LfmChatLogger.info("TOOL_CALL_RESULT success=${execResult.success} timeMs=${execResult.executionTimeMs}ms error=${execResult.error}")
+                                    responseText = LfmToolCallParser.formatToolResponse(execResult)
                                 }
-                                LfmChatLogger.info("TOOL_CALL_RESULT success=${execResult.success} timeMs=${execResult.executionTimeMs}ms error=${execResult.error}")
-
-                                val responseText = LfmToolCallParser.formatToolResponse(execResult)
                                 val respIds = tok.encode(responseText)
                                 if (respIds.isNotEmpty()) {
                                     generatedIds += respIds.toList()

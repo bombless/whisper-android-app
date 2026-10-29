@@ -216,4 +216,32 @@ class MarkdownRendererTest {
         assertTrue(text.contains("执行完成"))
         assertTrue(text.contains("应该被过滤"))
     }
+
+    @Test
+    fun testGenerateImageToolBlockRendering() {
+        val message = """
+            让我为您生成一张赛博朋克猫咪插图：
+            <tool_call>
+            <function=generate_image>
+            <parameter=prompt>
+            a cute cyberpunk cat with glowing neon glasses, 8k
+            </parameter>
+            </function>
+            </tool_call>
+            <tool_response>
+            [状态] 图像生成成功 (1024 × 1024)
+            [图像路径] /data/user/0/com.example.whisperapp/files/generated_images/sdxl_test.png
+            </tool_response>
+            图像已为您生成完毕！
+        """.trimIndent()
+
+        val blocks = parseMarkdownBlocks(message)
+        assertEquals(3, blocks.size)
+        assertTrue(blocks[1] is ChatMessageBlock.ToolExecutionBlock)
+        val toolBlock = blocks[1] as ChatMessageBlock.ToolExecutionBlock
+        assertEquals("本地 SDXL 生图", toolBlock.toolName)
+        assertEquals("a cute cyberpunk cat with glowing neon glasses, 8k", toolBlock.code)
+        assertTrue(toolBlock.response?.contains("[图像路径]") == true)
+        assertEquals(false, toolBlock.isRunning)
+    }
 }

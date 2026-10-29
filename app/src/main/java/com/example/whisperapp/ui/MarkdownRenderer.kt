@@ -1,8 +1,10 @@
 package com.example.whisperapp.ui
 
+import android.graphics.BitmapFactory
 import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
@@ -15,6 +17,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
@@ -32,6 +36,7 @@ import com.example.whisperapp.js.LfmToolCallParser
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import java.io.File
 
 /**
  * Structural representations of Markdown blocks.
@@ -144,9 +149,14 @@ fun parseMarkdownBlocks(rawText: String): List<ChatMessageBlock> {
         }
 
         val isRunning = response == null && !isClosed
+        val displayName = when {
+            toolName.equals("generate_image", ignoreCase = true) || toolName.contains("image", ignoreCase = true) || toolName.contains("生图") -> "本地 SDXL 生图"
+            toolName.equals("run_javascript", ignoreCase = true) -> "JavaScript 运行时"
+            else -> toolName
+        }
         blocks.add(
             ChatMessageBlock.ToolExecutionBlock(
-                toolName = if (toolName == "run_javascript") "JavaScript 运行时" else toolName,
+                toolName = displayName,
                 code = code,
                 response = response,
                 isRunning = isRunning
@@ -515,6 +525,27 @@ fun ToolExecutionCard(
     val clipboardManager = LocalClipboardManager.current
     var expanded by remember { mutableStateOf(true) }
 
+    val isImageTool = block.toolName.contains("生图") || block.toolName.contains("image", ignoreCase = true)
+    val toolIcon = if (isImageTool) "🎨" else "🛠️"
+    val runningText = if (isImageTool) "🎨 正在生成图像…" else "⚙️ 执行中…"
+    val successText = if (isImageTool) "✅ 图像生成完成" else "✅ 验证通过"
+    val failedText = if (isImageTool) "❌ 生成失败" else "❌ 未通过"
+    val codeHeader = if (isImageTool) "🎨 画面提示词 (Prompt):" else "💻 执行代码:"
+
+    val imagePath = remember(block.response) {
+        if (!isImageTool || block.response == null) null
+        else {
+            val regex = Regex("""\[(?:图像路径|文件路径)\]\s*([^\r\n]+)""")
+            regex.find(block.response)?.groupValues?.getOrNull(1)?.trim()
+        }
+    }
+    val bitmap = remember(imagePath) {
+        imagePath?.let { path ->
+            val f = File(path)
+            if (f.isFile) BitmapFactory.decodeFile(f.absolutePath) else null
+        }
+    }
+
     Surface(
         modifier = modifier
             .fillMaxWidth()
@@ -533,7 +564,7 @@ fun ToolExecutionCard(
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
-                        text = "🛠️ ${block.toolName}",
+                        text = "$toolIcon ${block.toolName}",
                         style = MaterialTheme.typography.labelMedium,
                         fontWeight = FontWeight.Bold,
                         color = MaterialTheme.colorScheme.primary
@@ -541,7 +572,7 @@ fun ToolExecutionCard(
                     Spacer(Modifier.width(8.dp))
                     if (block.isRunning) {
                         Text(
-                            text = "⚙️ 执行中…",
+                            text = runningText,
                             style = MaterialTheme.typography.labelSmall,
                             color = Color(0xFFFFB74D),
                             fontWeight = FontWeight.SemiBold
@@ -549,7 +580,7 @@ fun ToolExecutionCard(
                     } else if (block.response != null) {
                         val isFailed = block.response.contains("[执行失败]")
                         Text(
-                            text = if (isFailed) "❌ 未通过" else "✅ 验证通过",
+                            text = if (isFailed) failedText else successText,
                             style = MaterialTheme.typography.labelSmall,
                             color = if (isFailed) Color(0xFFE57373) else Color(0xFF81C784),
                             fontWeight = FontWeight.SemiBold
@@ -582,15 +613,34 @@ fun ToolExecutionCard(
             AnimatedVisibility(visible = expanded) {
                 Column(Modifier.padding(top = 8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     Text(
-                        text = "💻 执行代码:",
+                        text = codeHeader,
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
-                    FormattedCodeBlock(language = "javascript", code = block.code)
+                    FormattedCodeBlock(
+                        language = if (isImageTool) "markdown" else "javascript",
+                        code = block.code
+                    )
+
+                    if (bitmap != null) {
+                        Surface(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(8.dp)),
+                            border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.5f))
+                        ) {
+                            Image(
+                                bitmap = bitmap.asImageBitmap(),
+                                contentDescription = "SDXL 生成图像",
+                                modifier = Modifier.fillMaxWidth(),
+                                contentScale = ContentScale.FillWidth
+                            )
+                        }
+                    }
 
                     if (block.response != null) {
                         Text(
-                            text = "📋 运行时输出:",
+                            text = if (isImageTool) "📋 生成详情与输出:" else "📋 运行时输出:",
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )

@@ -6,6 +6,7 @@ package com.example.whisperapp.js
 data class ParsedToolCall(
     val name: String,
     val code: String,
+    val arguments: Map<String, String> = emptyMap(),
     val rawText: String,
     val startIndex: Int,
     val endIndex: Int
@@ -48,10 +49,12 @@ object LfmToolCallParser {
             val toolName = match.groupValues.getOrNull(1)?.takeIf { it.isNotBlank() }
                 ?: extractedName
                 ?: "run_javascript"
-            val code = extractCode(content)
+            val args = extractParameters(content)
+            val code = args["code"] ?: args["prompt"] ?: extractCode(content)
             return ParsedToolCall(
                 name = toolName,
                 code = code,
+                arguments = args,
                 rawText = match.value,
                 startIndex = fromIndex + match.range.first,
                 endIndex = fromIndex + match.range.last + 1
@@ -66,6 +69,7 @@ object LfmToolCallParser {
             return ParsedToolCall(
                 name = "run_javascript",
                 code = code,
+                arguments = mapOf("code" to code),
                 rawText = matchRunJs.value,
                 startIndex = fromIndex + matchRunJs.range.first,
                 endIndex = fromIndex + matchRunJs.range.last + 1
@@ -77,10 +81,12 @@ object LfmToolCallParser {
         if (matchFunc != null) {
             val toolName = matchFunc.groupValues.getOrNull(1)?.takeIf { it.isNotBlank() } ?: "run_javascript"
             val content = matchFunc.groupValues.getOrNull(2) ?: ""
-            val code = extractCode(content)
+            val args = extractParameters(content)
+            val code = args["code"] ?: args["prompt"] ?: extractCode(content)
             return ParsedToolCall(
                 name = toolName,
                 code = code,
+                arguments = args,
                 rawText = matchFunc.value,
                 startIndex = fromIndex + matchFunc.range.first,
                 endIndex = fromIndex + matchFunc.range.last + 1
@@ -186,11 +192,63 @@ object LfmToolCallParser {
     }
 
     /**
+     * Extracts named parameter dictionary from tool call content.
+     */
+    fun extractParameters(content: String): Map<String, String> {
+        val map = LinkedHashMap<String, String>()
+        val paramRegex = Regex(
+            """<(?:parameter|param)(?:\s*=\s*([a-zA-Z0-9_-]+)|\s+name="?([a-zA-Z0-9_-]+)"?)(?:\s*[^>]*)?>([\s\S]*?)</(?:parameter|param)>""",
+            RegexOption.IGNORE_CASE
+        )
+        for (m in paramRegex.findAll(content)) {
+            val key = m.groupValues[1].takeIf { it.isNotBlank() } ?: m.groupValues[2]
+            val value = extractCode(m.groupValues[3])
+            if (key.isNotBlank()) {
+                map[key] = value
+            }
+        }
+        if (map.isEmpty() && content.trim().startsWith("{")) {
+            runCatching {
+                val json = org.json.JSONObject(content.trim())
+                val args = when {
+                    json.has("arguments") && json.get("arguments") is org.json.JSONObject -> json.getJSONObject("arguments")
+                    json.has("parameters") && json.get("parameters") is org.json.JSONObject -> json.getJSONObject("parameters")
+                    else -> json
+                }
+                for (k in args.keys()) {
+                    map[k] = args.optString(k, "")
+                }
+            }
+        }
+        return map
+    }
+
+    /**
      * Formats a tool response XML block.
      */
     fun formatToolResponse(result: JsExecutionResult): String = buildString {
         append("\n<tool_response>\n")
         append(result.toOutputString())
         append("\n</tool_response>\n")
+    }
+
+    /**
+     * Formats an image generation tool response XML block.
+     */
+    fun formatImageToolResponse(
+        success: Boolean,
+        filePath: String?,
+        prompt: String,
+        error: String?
+    ): String = buildString {
+        append("\n<tool_response>\n")
+        if (success && filePath != null) {
+            append("[状态] 图像生成成功 (1024 × 1024)\n")
+            append("[图像路径] ").append(filePath).append("\n")
+            append("[提示词] ").append(prompt.take(120)).append("\n")
+        } else {
+            append("[执行失败] ").append(error ?: "未知错误").append("\n")
+        }
+        append("</tool_response>\n")
     }
 }

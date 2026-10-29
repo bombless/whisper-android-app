@@ -6,6 +6,9 @@ import org.mozilla.javascript.ContextFactory
 import org.mozilla.javascript.Function
 import org.mozilla.javascript.Scriptable
 import org.mozilla.javascript.ScriptableObject
+import java.io.InputStream
+import java.net.HttpURLConnection
+import java.net.URL
 import java.util.concurrent.Callable
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -156,6 +159,95 @@ object JsRuntime {
             ScriptableObject.putProperty(scope, "console", consoleObj)
             ScriptableObject.putProperty(scope, "assert", assertFn)
 
+            // Define fetch(url, options)
+            val fetchFn = object : BaseFunction() {
+                override fun call(cx: Context, scope: Scriptable, thisObj: Scriptable, args: Array<out Any?>): Any {
+                    if (args.isEmpty() || args[0] == null) {
+                        throw RuntimeException("fetch() 缺少 URL 参数")
+                    }
+                    val urlStr = Context.toString(args[0])
+                    val options = args.getOrNull(1) as? Scriptable
+
+                    var method = "GET"
+                    val headersMap = mutableMapOf<String, String>()
+                    var bodyBytes: ByteArray? = null
+                    var timeoutMs = 8000
+
+                    if (options != null) {
+                        val m = ScriptableObject.getProperty(options, "method")
+                        if (m != null && m != Context.getUndefinedValue()) {
+                            method = Context.toString(m).uppercase()
+                        }
+                        val h = ScriptableObject.getProperty(options, "headers")
+                        if (h is Scriptable) {
+                            for (id in h.ids) {
+                                val key = id.toString()
+                                val v = ScriptableObject.getProperty(h, key)
+                                if (v != null && v != Context.getUndefinedValue()) {
+                                    headersMap[key] = Context.toString(v)
+                                }
+                            }
+                        }
+                        val b = ScriptableObject.getProperty(options, "body")
+                        if (b != null && b != Context.getUndefinedValue()) {
+                            bodyBytes = Context.toString(b).toByteArray(Charsets.UTF_8)
+                        }
+                        val t = ScriptableObject.getProperty(options, "timeout")
+                        if (t is Number) {
+                            timeoutMs = t.toInt().coerceIn(500, 30000)
+                        }
+                    }
+
+                    val httpResult = performHttpRequest(urlStr, method, headersMap, bodyBytes, timeoutMs)
+
+                    val respObj = cx.newObject(scope)
+                    ScriptableObject.putProperty(respObj, "status", httpResult.statusCode)
+                    ScriptableObject.putProperty(respObj, "statusText", httpResult.statusMessage)
+                    ScriptableObject.putProperty(respObj, "ok", httpResult.statusCode in 200..299)
+                    ScriptableObject.putProperty(respObj, "url", urlStr)
+
+                    val textFn = object : BaseFunction() {
+                        override fun call(cx: Context, scope: Scriptable, thisObj: Scriptable, args: Array<out Any?>): Any {
+                            return httpResult.body
+                        }
+                    }
+                    ScriptableObject.putProperty(respObj, "text", textFn)
+
+                    val jsonFn = object : BaseFunction() {
+                        override fun call(cx: Context, scope: Scriptable, thisObj: Scriptable, args: Array<out Any?>): Any {
+                            val jsonObj = ScriptableObject.getProperty(scope, "JSON") as? Scriptable
+                            val parseFn = jsonObj?.let { ScriptableObject.getProperty(it, "parse") as? Function }
+                            return parseFn?.call(cx, scope, jsonObj, arrayOf(httpResult.body)) ?: Context.getUndefinedValue()
+                        }
+                    }
+                    ScriptableObject.putProperty(respObj, "json", jsonFn)
+
+                    val toStringFn = object : BaseFunction() {
+                        override fun call(cx: Context, scope: Scriptable, thisObj: Scriptable, args: Array<out Any?>): Any {
+                            return httpResult.body
+                        }
+                    }
+                    ScriptableObject.putProperty(respObj, "toString", toStringFn)
+
+                    return respObj
+                }
+            }
+
+            // Define httpGet(url) convenience wrapper
+            val httpGetFn = object : BaseFunction() {
+                override fun call(cx: Context, scope: Scriptable, thisObj: Scriptable, args: Array<out Any?>): Any {
+                    if (args.isEmpty() || args[0] == null) {
+                        throw RuntimeException("httpGet() 缺少 URL 参数")
+                    }
+                    val urlStr = Context.toString(args[0])
+                    val httpResult = performHttpRequest(urlStr, "GET", emptyMap(), null, 8000)
+                    return httpResult.body
+                }
+            }
+
+            ScriptableObject.putProperty(scope, "fetch", fetchFn)
+            ScriptableObject.putProperty(scope, "httpGet", httpGetFn)
+
             val rawResult = cx.evaluateString(scope, code, "tool_script.js", 1, null)
             val resultStr = formatJsValue(cx, scope, rawResult)
             return resultStr to stdoutList.joinToString("\n")
@@ -180,5 +272,54 @@ object JsRuntime {
             }.getOrElse { Context.toString(value) }
         }
         return Context.toString(value)
+    }
+
+    private data class HttpResponse(
+        val statusCode: Int,
+        val statusMessage: String,
+        val body: String
+    )
+
+    private fun performHttpRequest(
+        urlStr: String,
+        method: String,
+        headers: Map<String, String>,
+        bodyBytes: ByteArray?,
+        timeoutMs: Int
+    ): HttpResponse {
+        val url = URL(urlStr)
+        val conn = url.openConnection() as HttpURLConnection
+        try {
+            conn.requestMethod = method
+            conn.connectTimeout = timeoutMs
+            conn.readTimeout = timeoutMs
+            conn.instanceFollowRedirects = true
+            conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Android; WhisperApp)")
+
+            for ((k, v) in headers) {
+                conn.setRequestProperty(k, v)
+            }
+
+            if (bodyBytes != null && (method == "POST" || method == "PUT" || method == "PATCH")) {
+                conn.doOutput = true
+                conn.outputStream.use { it.write(bodyBytes) }
+            }
+
+            val statusCode = conn.responseCode
+            val statusMessage = conn.responseMessage ?: ""
+            val stream: InputStream? = if (statusCode in 200..399) {
+                conn.inputStream
+            } else {
+                conn.errorStream ?: runCatching { conn.inputStream }.getOrNull()
+            }
+            val body = stream?.bufferedReader()?.use { it.readText() } ?: ""
+            return HttpResponse(
+                statusCode = statusCode,
+                statusMessage = statusMessage,
+                body = body
+            )
+        } finally {
+            runCatching { conn.disconnect() }
+        }
     }
 }

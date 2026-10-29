@@ -180,4 +180,43 @@ class LfmToolCallParserTest {
         val extracted2 = LfmToolCallParser.extractCode(streamingWithClosing)
         assertEquals("const x = 42;", extracted2)
     }
+
+    @Test
+    fun testGenerateImageToolCallParsing() {
+        val text = """
+            <tool_call>
+            <function=generate_image>
+            <parameter=prompt>
+            a cute cyberpunk cat wearing neon sunglasses, 8k
+            </parameter>
+            <parameter=negative_prompt>
+            blurry, low quality
+            </parameter>
+            <parameter=steps>
+            25
+            </parameter>
+            </function>
+            </tool_call>
+        """.trimIndent()
+
+        val call = LfmToolCallParser.findNextToolCall(text)
+        assertNotNull(call)
+        assertEquals("generate_image", call?.name)
+        assertEquals("a cute cyberpunk cat wearing neon sunglasses, 8k", call?.arguments?.get("prompt"))
+        assertEquals("blurry, low quality", call?.arguments?.get("negative_prompt"))
+        assertEquals("25", call?.arguments?.get("steps"))
+        assertEquals("a cute cyberpunk cat wearing neon sunglasses, 8k", call?.code)
+    }
+
+    @Test
+    fun testJsRuntimeFetchAndHttpGetDefined() {
+        val js = """
+            assert(typeof fetch === 'function', "fetch should be defined");
+            assert(typeof httpGet === 'function', "httpGet should be defined");
+            console.log("Fetch and httpGet are ready");
+        """.trimIndent()
+        val res = JsRuntime.execute(js)
+        assertTrue("JS execution failed: ${res.error}", res.success)
+        assertTrue(res.stdout.contains("Fetch and httpGet are ready"))
+    }
 }
