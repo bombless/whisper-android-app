@@ -357,7 +357,7 @@ private fun EmptyChatGreeting(
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("💬 LFM3 本地对话助手", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
             Text(
-                "现已支持：\n• CoT 深度思考引导：以「让我把完整的方案想清楚再输出」进行长链路规划\n• 最大 4096 / 8192 词元长文本生成（解决红黑树等复杂代码截断）\n• 代码块高亮、横向滚动与一键复制代码\n• 折叠式思考过程与 Markdown 渲染",
+                "现已支持：\n• 🛠️ JavaScript 运行时与自主工具调用：模型可调用工具自测红黑树等算法\n• ⚡ 交互式代码测试：在任何 JavaScript 代码块上一键「▶ 运行 JS」并查看实时输出\n• 💭 CoT 深度思考过程折叠与复制\n• 📝 4096 / 8192 词元长文本生成与 Markdown 高亮",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -366,9 +366,9 @@ private fun EmptyChatGreeting(
             Text("快速体验：", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
 
             val suggestions = listOf(
-                "write a python red black tree",
-                "用 Python 实现一个完整的红黑树",
-                "写一个带有协程取消处理的 Kotlin 示例",
+                "请用 JavaScript 实现一个红黑树，并调用 JavaScript 工具运行测试以确保正确性",
+                "写一个双指针快速排序，并调用工具测试逆序和重复元素用例",
+                "请用 JavaScript 编写矩阵快速幂计算斐波那契数列第50项并运行验证",
                 "请解释红黑树与普通平衡二叉树的区别"
             )
 

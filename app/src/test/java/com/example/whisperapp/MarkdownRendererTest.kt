@@ -4,6 +4,7 @@ import com.example.whisperapp.ui.ChatMessageBlock
 import com.example.whisperapp.ui.buildAnnotatedMarkdown
 import com.example.whisperapp.ui.parseMarkdownBlocks
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -102,5 +103,42 @@ class MarkdownRendererTest {
         val codeBlock = blocks.filterIsInstance<ChatMessageBlock.CodeBlock>().firstOrNull()
         assertTrue("Code block should be parsed", codeBlock != null)
         assertEquals("python", codeBlock?.language)
+    }
+
+    @Test
+    fun testToolCallBlockParsing() {
+        val message = """
+            让我用 JavaScript 编写并测试红黑树：
+            <tool_call>
+            ```javascript
+            const tree = new RedBlackTree();
+            tree.insert(10);
+            console.log("Root:", tree.root.key);
+            ```
+            </tool_call>
+            <tool_response>
+            [输出]
+            Root: 10
+            [返回值] undefined
+            </tool_response>
+            测试表明红黑树插入成功，黑色高度平衡！
+        """.trimIndent()
+
+        val blocks = parseMarkdownBlocks(message)
+        assertEquals(3, blocks.size)
+        assertTrue(blocks[0] is ChatMessageBlock.TextBlock)
+        assertTrue((blocks[0] as ChatMessageBlock.TextBlock).content.contains("让我用 JavaScript 编写并测试红黑树"))
+
+        assertTrue(blocks[1] is ChatMessageBlock.ToolExecutionBlock)
+        val toolBlock = blocks[1] as ChatMessageBlock.ToolExecutionBlock
+        assertEquals("JavaScript 运行时", toolBlock.toolName)
+        assertTrue("Tool block code should be extracted", toolBlock.code.contains("const tree = new RedBlackTree();"))
+        assertTrue("Tool block code should not contain fences", !toolBlock.code.contains("```"))
+        assertNotNull(toolBlock.response)
+        assertTrue("Tool response should contain Root: 10", toolBlock.response?.contains("Root: 10") == true)
+        assertEquals(false, toolBlock.isRunning)
+
+        assertTrue(blocks[2] is ChatMessageBlock.TextBlock)
+        assertTrue((blocks[2] as ChatMessageBlock.TextBlock).content.contains("测试表明红黑树插入成功"))
     }
 }

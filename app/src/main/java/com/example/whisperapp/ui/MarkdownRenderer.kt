@@ -26,13 +26,24 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.whisperapp.js.JsExecutionResult
+import com.example.whisperapp.js.JsRuntime
+import com.example.whisperapp.js.LfmToolCallParser
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 /**
  * Structural representations of Markdown blocks.
  */
 sealed interface ChatMessageBlock {
     data class CodeBlock(val language: String, val code: String) : ChatMessageBlock
+    data class ToolExecutionBlock(
+        val toolName: String,
+        val code: String,
+        val response: String?,
+        val isRunning: Boolean
+    ) : ChatMessageBlock
     data class HeadingBlock(val level: Int, val text: String) : ChatMessageBlock
     data class BulletItemBlock(val text: String) : ChatMessageBlock
     data class NumberedItemBlock(val number: String, val text: String) : ChatMessageBlock
@@ -41,10 +52,72 @@ sealed interface ChatMessageBlock {
 }
 
 /**
- * Parses markdown text into structured blocks (Code blocks, headings, lists, quotes, paragraphs).
+ * Parses markdown text into structured blocks (Code blocks, tool executions, headings, lists, quotes, paragraphs).
  * Supports partial/streaming markdown safely.
  */
 fun parseMarkdownBlocks(rawText: String): List<ChatMessageBlock> {
+    if (!rawText.contains("<tool_call", ignoreCase = true) && !rawText.contains("<run_javascript", ignoreCase = true)) {
+        return parseStandardMarkdownBlocks(rawText)
+    }
+
+    val blocks = mutableListOf<ChatMessageBlock>()
+    val toolCallPattern = Regex(
+        """<tool_call(?::([a-zA-Z0-9_-]+))?>([\s\S]*?)(?:</tool_call(?::\1)?>|$)""",
+        RegexOption.IGNORE_CASE
+    )
+    val toolResponsePattern = Regex(
+        """\s*<tool_response>([\s\S]*?)(?:</tool_response>|$)""",
+        RegexOption.IGNORE_CASE
+    )
+
+    var cursor = 0
+    val matches = toolCallPattern.findAll(rawText).toList()
+
+    for (match in matches) {
+        val start = match.range.first
+        if (start > cursor) {
+            val prefix = rawText.substring(cursor, start).trim()
+            if (prefix.isNotEmpty()) {
+                blocks.addAll(parseStandardMarkdownBlocks(prefix))
+            }
+        }
+
+        val toolName = match.groupValues.getOrNull(1)?.takeIf { it.isNotBlank() } ?: "JavaScript 运行时"
+        val rawCode = match.groupValues.getOrNull(2) ?: ""
+        val code = LfmToolCallParser.extractCode(rawCode)
+
+        var afterToolCall = rawText.substring(match.range.last + 1)
+        val responseMatch = toolResponsePattern.find(afterToolCall)
+        val response = if (responseMatch != null && responseMatch.range.first == 0) {
+            cursor = match.range.last + 1 + responseMatch.range.last + 1
+            responseMatch.groupValues[1].trim()
+        } else {
+            cursor = match.range.last + 1
+            null
+        }
+
+        val isRunning = response == null && !match.value.contains("</tool_call", ignoreCase = true)
+        blocks.add(
+            ChatMessageBlock.ToolExecutionBlock(
+                toolName = toolName,
+                code = code,
+                response = response,
+                isRunning = isRunning
+            )
+        )
+    }
+
+    if (cursor < rawText.length) {
+        val remaining = rawText.substring(cursor).trim()
+        if (remaining.isNotEmpty()) {
+            blocks.addAll(parseStandardMarkdownBlocks(remaining))
+        }
+    }
+
+    return blocks
+}
+
+private fun parseStandardMarkdownBlocks(rawText: String): List<ChatMessageBlock> {
     val blocks = mutableListOf<ChatMessageBlock>()
     val lines = rawText.lines()
     var i = 0
@@ -64,7 +137,7 @@ fun parseMarkdownBlocks(rawText: String): List<ChatMessageBlock> {
         val line = lines[i]
         val trimmed = line.trim()
 
-        // 1. Fenced Code Block (e.g. ```python)
+        // 1. Fenced Code Block (e.g. ```javascript)
         if (trimmed.startsWith("```")) {
             flushText()
             val lang = trimmed.removePrefix("```").trim()
@@ -148,62 +221,65 @@ private val INLINE_REGEX = Regex(
 fun buildAnnotatedMarkdown(
     text: String,
     codeBg: Color = Color(0x1F888888),
-    codeColor: Color = Color.Unspecified
-): AnnotatedString = buildAnnotatedString {
-    var lastIndex = 0
-    for (match in INLINE_REGEX.findAll(text)) {
-        if (match.range.first > lastIndex) {
-            append(text.substring(lastIndex, match.range.first))
+    codeColor: Color = Color(0xFFE57373)
+): AnnotatedString {
+    return buildAnnotatedString {
+        var cursor = 0
+        val matches = INLINE_REGEX.findAll(text).toList()
+
+        for (match in matches) {
+            val range = match.range
+            if (range.first > cursor) {
+                append(text.substring(cursor, range.first))
+            }
+
+            val value = match.value
+            when {
+                value.startsWith("`") && value.endsWith("`") -> {
+                    withStyle(
+                        SpanStyle(
+                            background = codeBg,
+                            color = codeColor,
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 13.sp
+                        )
+                    ) {
+                        append(" ${value.removeSurrounding("`")} ")
+                    }
+                }
+                value.startsWith("***") && value.endsWith("***") -> {
+                    withStyle(SpanStyle(fontWeight = FontWeight.Bold, fontStyle = FontStyle.Italic)) {
+                        append(value.removeSurrounding("***"))
+                    }
+                }
+                (value.startsWith("**") && value.endsWith("**")) ||
+                (value.startsWith("__") && value.endsWith("__")) -> {
+                    val raw = if (value.startsWith("**")) value.removeSurrounding("**") else value.removeSurrounding("__")
+                    withStyle(SpanStyle(fontWeight = FontWeight.Bold)) {
+                        append(raw)
+                    }
+                }
+                (value.startsWith("*") && value.endsWith("*")) ||
+                (value.startsWith("_") && value.endsWith("_")) -> {
+                    val raw = if (value.startsWith("*")) value.removeSurrounding("*") else value.removeSurrounding("_")
+                    withStyle(SpanStyle(fontStyle = FontStyle.Italic)) {
+                        append(raw)
+                    }
+                }
+                else -> append(value)
+            }
+            cursor = range.last + 1
         }
-        val raw = match.value
-        when {
-            raw.startsWith("`") && raw.endsWith("`") && raw.length >= 2 -> {
-                val code = raw.substring(1, raw.length - 1)
-                withStyle(
-                    SpanStyle(
-                        fontFamily = FontFamily.Monospace,
-                        background = codeBg,
-                        color = codeColor,
-                        fontWeight = FontWeight.SemiBold
-                    )
-                ) {
-                    append(" $code ")
-                }
-            }
-            raw.startsWith("***") && raw.endsWith("***") && raw.length >= 6 -> {
-                val inner = raw.substring(3, raw.length - 3)
-                withStyle(SpanStyle(fontWeight = FontWeight.Bold, fontStyle = FontStyle.Italic)) {
-                    append(inner)
-                }
-            }
-            (raw.startsWith("**") && raw.endsWith("**") && raw.length >= 4) ||
-            (raw.startsWith("__") && raw.endsWith("__") && raw.length >= 4) -> {
-                val inner = raw.substring(2, raw.length - 2)
-                withStyle(SpanStyle(fontWeight = FontWeight.Bold)) {
-                    append(inner)
-                }
-            }
-            (raw.startsWith("*") && raw.endsWith("*") && raw.length >= 2) ||
-            (raw.startsWith("_") && raw.endsWith("_") && raw.length >= 2) -> {
-                val inner = raw.substring(1, raw.length - 1)
-                withStyle(SpanStyle(fontStyle = FontStyle.Italic)) {
-                    append(inner)
-                }
-            }
-            else -> {
-                append(raw)
-            }
+
+        if (cursor < text.length) {
+            append(text.substring(cursor))
         }
-        lastIndex = match.range.last + 1
-    }
-    if (lastIndex < text.length) {
-        append(text.substring(lastIndex))
     }
 }
 
 /**
- * Renders a code block in a dark terminal style container with language badge,
- * copy button, and horizontal scrolling for monospace code.
+ * Beautiful, dark styled code block view with syntax highlighting aesthetics,
+ * horizontal scrolling, one-click copy, and interactive JavaScript run button.
  */
 @Composable
 fun FormattedCodeBlock(
@@ -211,9 +287,15 @@ fun FormattedCodeBlock(
     code: String,
     modifier: Modifier = Modifier
 ) {
+    val context = LocalContext.current
     val clipboardManager = LocalClipboardManager.current
-    var copied by remember { mutableStateOf(false) }
     val scrollState = rememberScrollState()
+    val scope = rememberCoroutineScope()
+    var copied by remember { mutableStateOf(false) }
+    var isRunning by remember { mutableStateOf(false) }
+    var runResult by remember { mutableStateOf<JsExecutionResult?>(null) }
+
+    val isJs = language.lowercase() in listOf("javascript", "js")
 
     LaunchedEffect(copied) {
         if (copied) {
@@ -245,23 +327,52 @@ fun FormattedCodeBlock(
                     fontFamily = FontFamily.Monospace,
                     fontWeight = FontWeight.Bold
                 )
-                TextButton(
-                    onClick = {
-                        clipboardManager.setText(AnnotatedString(code))
-                        copied = true
-                    },
-                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
-                    modifier = Modifier.height(26.dp)
-                ) {
-                    Text(
-                        text = if (copied) "✓ 已复制" else "复制",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = if (copied) Color(0xFF4CAF50) else Color(0xFF90CAF9)
-                    )
+
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    // Interactive Run JS button
+                    if (isJs) {
+                        TextButton(
+                            onClick = {
+                                if (!isRunning) {
+                                    scope.launch(Dispatchers.Default) {
+                                        isRunning = true
+                                        val res = JsRuntime.execute(code)
+                                        runResult = res
+                                        isRunning = false
+                                    }
+                                }
+                            },
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                            modifier = Modifier.height(26.dp)
+                        ) {
+                            Text(
+                                text = if (isRunning) "▶ 运行中…" else "▶ 运行 JS",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (isRunning) Color(0xFFFFB74D) else Color(0xFF81C784),
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                    }
+
+                    // Copy button
+                    TextButton(
+                        onClick = {
+                            clipboardManager.setText(AnnotatedString(code))
+                            copied = true
+                        },
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                        modifier = Modifier.height(26.dp)
+                    ) {
+                        Text(
+                            text = if (copied) "✓ 已复制" else "复制",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (copied) Color(0xFF4CAF50) else Color(0xFF90CAF9)
+                        )
+                    }
                 }
             }
 
-            // Code content with horizontal scroll to prevent wrap distortion
+            // Code content with horizontal scroll
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -292,6 +403,169 @@ fun FormattedCodeBlock(
                     color = Color(0xFF64B5F6),
                     trackColor = Color(0xFF282832)
                 )
+            }
+
+            // Interactive execution output panel
+            if (runResult != null) {
+                Surface(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 10.dp, vertical = 8.dp),
+                    shape = RoundedCornerShape(6.dp),
+                    color = Color(0xFF141419),
+                    border = BorderStroke(1.dp, Color(0xFF2D2D3A))
+                ) {
+                    Column(Modifier.padding(10.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = if (runResult!!.success) "⚡ 运行结果 (${runResult!!.executionTimeMs}ms)" else "❌ 运行失败 (${runResult!!.executionTimeMs}ms)",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (runResult!!.success) Color(0xFF81C784) else Color(0xFFE57373),
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                text = "✕ 关闭",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = Color.Gray,
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(4.dp))
+                                    .clickable { runResult = null }
+                                    .padding(horizontal = 4.dp, vertical = 2.dp)
+                            )
+                        }
+                        val out = runResult!!.toOutputString()
+                        Text(
+                            text = out.ifBlank { "[状态] 执行成功，无日志输出" },
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 11.5.sp,
+                            lineHeight = 16.sp,
+                            color = Color(0xFFCCCCCC),
+                            modifier = Modifier.padding(top = 4.dp)
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Dedicated Card for displaying autonomous model tool calls and responses.
+ */
+@Composable
+fun ToolExecutionCard(
+    block: ChatMessageBlock.ToolExecutionBlock,
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current
+    val clipboardManager = LocalClipboardManager.current
+    var expanded by remember { mutableStateOf(true) }
+
+    Surface(
+        modifier = modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp)),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.45f))
+    ) {
+        Column(Modifier.padding(10.dp)) {
+            // Header bar
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { expanded = !expanded },
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = "🛠️ ${block.toolName}",
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    if (block.isRunning) {
+                        Text(
+                            text = "⚙️ 执行中…",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = Color(0xFFFFB74D),
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    } else if (block.response != null) {
+                        val isFailed = block.response.contains("[执行失败]")
+                        Text(
+                            text = if (isFailed) "❌ 未通过" else "✅ 验证通过",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (isFailed) Color(0xFFE57373) else Color(0xFF81C784),
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                }
+
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    if (block.response != null) {
+                        Text(
+                            text = "复制结果",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.tertiary,
+                            modifier = Modifier
+                                .padding(end = 8.dp)
+                                .clickable {
+                                    clipboardManager.setText(AnnotatedString(block.response))
+                                    Toast.makeText(context, "已复制工具执行输出", Toast.LENGTH_SHORT).show()
+                                }
+                        )
+                    }
+                    Text(
+                        text = if (expanded) "▲ 收起" else "▼ 展开",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+
+            AnimatedVisibility(visible = expanded) {
+                Column(Modifier.padding(top = 8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text(
+                        text = "💻 执行代码:",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    FormattedCodeBlock(language = "javascript", code = block.code)
+
+                    if (block.response != null) {
+                        Text(
+                            text = "📋 运行时输出:",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Surface(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(6.dp),
+                            color = Color(0xFF141419),
+                            border = BorderStroke(1.dp, Color(0xFF2E2E3C))
+                        ) {
+                            Text(
+                                text = block.response,
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 11.5.sp,
+                                lineHeight = 16.sp,
+                                color = Color(0xFFDDDDDD),
+                                modifier = Modifier.padding(10.dp)
+                            )
+                        }
+                    } else if (block.isRunning) {
+                        LinearProgressIndicator(
+                            modifier = Modifier.fillMaxWidth().height(3.dp),
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                }
             }
         }
     }
@@ -326,7 +600,6 @@ fun MarkdownMessageView(
     var manuallyToggled by remember { mutableStateOf(false) }
     var thinkExpanded by remember { mutableStateOf(isThinkingInProgress) }
 
-    // Auto-expand while generating thoughts, auto-collapse when thought finishes and code arrives
     LaunchedEffect(isThinkingInProgress) {
         if (!manuallyToggled) {
             thinkExpanded = isThinkingInProgress
@@ -397,6 +670,9 @@ fun MarkdownMessageView(
         // Main Markdown blocks
         for (block in blocks) {
             when (block) {
+                is ChatMessageBlock.ToolExecutionBlock -> {
+                    ToolExecutionCard(block)
+                }
                 is ChatMessageBlock.CodeBlock -> {
                     FormattedCodeBlock(language = block.language, code = block.code)
                 }

@@ -77,6 +77,7 @@ android {
 }
 
 dependencies {
+    implementation("org.mozilla:rhino:1.9.1")
     implementation(fileTree(mapOf("dir" to "../lib/runtime", "include" to listOf("*.jar"))))
     implementation(files("../lib/runtime/sherpa-onnx-1.13.8-no-ort.aar"))
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.27.0")
@@ -93,4 +94,3 @@ dependencies {
     testImplementation(kotlin("test"))
     testImplementation("junit:junit:4.13.2")
 }
-
