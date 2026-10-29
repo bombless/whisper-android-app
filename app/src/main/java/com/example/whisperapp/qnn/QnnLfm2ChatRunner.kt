@@ -6,10 +6,13 @@ import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtLoggingLevel
 import ai.onnxruntime.OrtSession
 import android.content.Context
+import android.os.PowerManager
 import android.util.Log
 import com.example.whisperapp.js.JsRuntime
 import com.example.whisperapp.js.LfmToolCallParser
 import java.io.File
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import java.nio.LongBuffer
 
@@ -58,21 +61,33 @@ assert(result === 2, "1 + 1 应该等于 2");
     private const val HEAD_DIM = 128
 
     private class ConvCachePool {
-        private val buffers = HashMap<Int, FloatArray>()
+        private val buffers = HashMap<Int, FloatBuffer>()
         init {
             for (l in CONV_LAYERS) {
-                buffers[l] = FloatArray(CONV_CHANNELS * CONV_KERNEL)
+                val bb = ByteBuffer.allocateDirect(CONV_CHANNELS * CONV_KERNEL * 4)
+                    .order(ByteOrder.nativeOrder())
+                buffers[l] = bb.asFloatBuffer()
             }
         }
-        fun get(layer: Int): FloatArray = buffers.getValue(layer)
+        fun get(layer: Int): FloatBuffer {
+            val b = buffers.getValue(layer)
+            b.clear()
+            return b
+        }
         fun reset() {
-            for (b in buffers.values) b.fill(0f)
+            for (b in buffers.values) {
+                b.clear()
+                while (b.hasRemaining()) b.put(0f)
+                b.clear()
+            }
         }
     }
 
     private class KvLayerCache(initialCapacityTokens: Int = 1024) {
         private var capacity = initialCapacityTokens
-        var array = FloatArray(512 * capacity)
+        var directBuffer: FloatBuffer = ByteBuffer.allocateDirect(512 * capacity * 4)
+            .order(ByteOrder.nativeOrder())
+            .asFloatBuffer()
             private set
 
         fun reset() {}
@@ -81,21 +96,34 @@ assert(result === 2, "1 + 1 应该等于 2");
             if (tokens > capacity) {
                 var newCap = capacity * 2
                 while (newCap < tokens) newCap *= 2
-                val newArr = FloatArray(512 * newCap)
-                System.arraycopy(array, 0, newArr, 0, 512 * capacity)
-                array = newArr
+                val newBb = ByteBuffer.allocateDirect(512 * newCap * 4)
+                    .order(ByteOrder.nativeOrder())
+                val newFb = newBb.asFloatBuffer()
+                val oldFb = directBuffer.duplicate()
+                oldFb.position(0)
+                oldFb.limit(512 * capacity)
+                newFb.put(oldFb)
+                directBuffer = newFb
                 capacity = newCap
             }
         }
 
         fun wrap(tokens: Int): FloatBuffer {
-            return FloatBuffer.wrap(array, 0, 512 * tokens)
+            val fb = directBuffer.duplicate()
+            fb.position(0)
+            fb.limit(512 * tokens)
+            return fb
         }
 
         fun updateFrom(tensor: OnnxTensor, totalTokens: Int) {
             ensureCapacity(totalTokens)
-            val fb = tensor.floatBuffer
-            fb.get(array, 0, 512 * totalTokens)
+            val srcFb = tensor.floatBuffer
+            val dstFb = directBuffer.duplicate()
+            dstFb.position(0)
+            dstFb.limit(512 * totalTokens)
+            srcFb.position(0)
+            srcFb.limit(512 * totalTokens)
+            dstFb.put(srcFb)
         }
     }
 
@@ -116,9 +144,47 @@ assert(result === 2, "1 + 1 应该等于 2");
         }
     }
 
+    private class SessionOutputBindings(session: OrtSession) {
+        val logitsIndex: Int
+        val convIndices = IntArray(CONV_LAYERS.maxOrNull()?.plus(1) ?: 24) { -1 }
+        val kvKeyIndices = IntArray(KV_LAYERS.maxOrNull()?.plus(1) ?: 24) { -1 }
+        val kvValIndices = IntArray(KV_LAYERS.maxOrNull()?.plus(1) ?: 24) { -1 }
+
+        init {
+            val names = session.outputNames.toList()
+            logitsIndex = names.indexOf("logits")
+            for (l in CONV_LAYERS) {
+                convIndices[l] = names.indexOf("present_conv.$l")
+            }
+            for (l in KV_LAYERS) {
+                kvKeyIndices[l] = names.indexOf("present.$l.key")
+                kvValIndices[l] = names.indexOf("present.$l.value")
+            }
+        }
+    }
+
     private val convPool = ConvCachePool()
     private val kvPool = KvCachePool()
-    private val staticAllOnesMask = LongArray(8192) { 1L }
+    private var outputBindings: SessionOutputBindings? = null
+
+    private val staticAllOnesBuffer: LongBuffer = ByteBuffer.allocateDirect(8192 * 8)
+        .order(ByteOrder.nativeOrder())
+        .asLongBuffer().apply {
+            for (i in 0 until 8192) put(1L)
+            clear()
+        }
+    private val posDirectBuffer: LongBuffer = ByteBuffer.allocateDirect(DEFAULT_MAX_TOKENS * 8)
+        .order(ByteOrder.nativeOrder())
+        .asLongBuffer()
+    private val inputIdDirectBuffer: LongBuffer = ByteBuffer.allocateDirect(DEFAULT_MAX_TOKENS * 8)
+        .order(ByteOrder.nativeOrder())
+        .asLongBuffer()
+    private val logitsToKeepBuffer: LongBuffer = ByteBuffer.allocateDirect(8)
+        .order(ByteOrder.nativeOrder())
+        .asLongBuffer().apply {
+            put(1L)
+            clear()
+        }
 
     @Volatile
     private var cancelRequested = false
@@ -181,7 +247,7 @@ assert(result === 2, "1 + 1 应该等于 2");
                         "htp_arch" to "75",
                         "enable_htp_fp16_precision" to "1",
                         "enable_block_quant_weight_optimization" to "1",
-                        "htp_performance_mode" to "burst",
+                        "htp_performance_mode" to "sustained_high_performance",
                         "qnn_context_priority" to "high",
                         "vtcm_mb" to "8",
                         "htp_graph_finalization_optimization_mode" to "3",
@@ -191,9 +257,13 @@ assert(result === 2, "1 + 1 应该等于 2");
                 LfmChatLogger.info("creating ONNX session with QNN HTP backend...")
                 session = env!!.createSession(model.absolutePath, options)
                 options.close()
+                outputBindings = SessionOutputBindings(session!!)
                 LfmChatLogger.info("session created with QNN HTP inputs=${session!!.inputNames.size} outputs=${session!!.outputNames.size}")
             } else {
                 LfmChatLogger.info("reusing existing ONNX session")
+                if (outputBindings == null) {
+                    outputBindings = SessionOutputBindings(session!!)
+                }
             }
             stage = "load_tokenizer"
             tokenizer = tokenizer ?: LfmTokenizer.fromAssets(app.assets)
@@ -246,9 +316,15 @@ assert(result === 2, "1 + 1 应该等于 2");
         val stepLatencies = ArrayList<Double>()
         onToken?.invoke(lastDecodeText)
 
+        val powerManager = context.applicationContext.getSystemService(Context.POWER_SERVICE) as? PowerManager
+        val wakeLock = powerManager?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "whisperapp:LFM3_INFERENCE")?.apply {
+            setReferenceCounted(false)
+            runCatching { acquire(10 * 60 * 1000L) }
+        }
+
         val runOptions = OrtSession.RunOptions().apply {
-            addRunConfigEntry("qnn.htp_perf_mode", "burst")
-            addRunConfigEntry("qnn.perf_mode", "burst")
+            addRunConfigEntry("qnn.htp_perf_mode", "sustained_high_performance")
+            addRunConfigEntry("qnn.perf_mode", "sustained_high_performance")
         }
 
         try {
@@ -260,34 +336,49 @@ assert(result === 2, "1 + 1 应该等于 2");
                 }
                 val stepT0 = System.nanoTime()
                 val sequenceLength = inputIds.size
-                val inputs = LinkedHashMap<String, OnnxTensor>()
-                val owned = ArrayList<OnnxTensor>()
+                val inputs = LinkedHashMap<String, OnnxTensor>(64)
+                val owned = ArrayList<OnnxTensor>(48)
                 try {
                     val totalMaskLen = pastLen + sequenceLength
-                    val maskBuffer = if (totalMaskLen <= staticAllOnesMask.size) {
-                        LongBuffer.wrap(staticAllOnesMask, 0, totalMaskLen)
+                    val maskBuffer = if (totalMaskLen <= staticAllOnesBuffer.capacity()) {
+                        val b = staticAllOnesBuffer.duplicate()
+                        b.position(0)
+                        b.limit(totalMaskLen)
+                        b
                     } else {
                         LongBuffer.wrap(LongArray(totalMaskLen) { 1L })
                     }
-                    val posArray = if (sequenceLength == 1) {
-                        longArrayOf(pastLen.toLong())
+                    val posBuf = if (sequenceLength <= posDirectBuffer.capacity()) {
+                        posDirectBuffer.clear()
+                        for (i in 0 until sequenceLength) posDirectBuffer.put((pastLen + i).toLong())
+                        posDirectBuffer.flip()
+                        posDirectBuffer.duplicate()
                     } else {
-                        LongArray(sequenceLength) { (pastLen + it).toLong() }
+                        LongBuffer.wrap(LongArray(sequenceLength) { (pastLen + it).toLong() })
                     }
+                    val inputBuf = if (sequenceLength <= inputIdDirectBuffer.capacity()) {
+                        inputIdDirectBuffer.clear()
+                        for (id in inputIds) inputIdDirectBuffer.put(id.toLong())
+                        inputIdDirectBuffer.flip()
+                        inputIdDirectBuffer.duplicate()
+                    } else {
+                        LongBuffer.wrap(inputIds.map { it.toLong() }.toLongArray())
+                    }
+                    val logitsToKeepBuf = logitsToKeepBuffer.duplicate().apply { position(0); limit(1) }
 
-                    inputs["input_ids"] = longTensor(inputIds.map { it.toLong() }.toLongArray(), longArrayOf(1, sequenceLength.toLong()), owned)
+                    inputs["input_ids"] = longTensor(inputBuf, longArrayOf(1, sequenceLength.toLong()), owned)
                     inputs["attention_mask"] = longTensor(maskBuffer, longArrayOf(1, totalMaskLen.toLong()), owned)
-                    inputs["position_ids"] = longTensor(posArray, longArrayOf(1, sequenceLength.toLong()), owned)
-                    inputs["logits_to_keep"] = longTensor(longArrayOf(1L), longArrayOf(1), owned)
+                    inputs["position_ids"] = longTensor(posBuf, longArrayOf(1, sequenceLength.toLong()), owned)
+                    inputs["logits_to_keep"] = longTensor(logitsToKeepBuf, longArrayOf(1), owned)
 
-                    // Conv state cache (13 layers) - zero heap allocation via preallocated buffers
+                    // Conv state cache (13 layers) - zero heap allocation via direct buffers
                     for (layer in CONV_LAYERS) {
                         inputs["past_conv.$layer"] = floatTensor(
                             convPool.get(layer),
                             longArrayOf(1, CONV_CHANNELS.toLong(), CONV_KERNEL.toLong()), owned
                         )
                     }
-                    // KV attention cache (11 layers) - zero heap allocation via capacity pooling
+                    // KV attention cache (11 layers) - zero heap allocation via direct buffers
                     for (layer in KV_LAYERS) {
                         val k = "past_key_values.$layer.key"
                         val v = "past_key_values.$layer.value"
@@ -304,19 +395,27 @@ assert(result === 2, "1 + 1 应该等于 2");
                     val prepNs = System.nanoTime()
                     s.run(inputs, runOptions).use { result ->
                         val runNs = System.nanoTime()
-                        val outputs = s.outputNames.associateWith { name -> result[s.outputNames.indexOf(name)] as OnnxTensor }
-                        val logits = outputs.getValue("logits")
+                        val outBindings = outputBindings ?: SessionOutputBindings(s).also { outputBindings = it }
+                        val logits = result[outBindings.logitsIndex] as OnnxTensor
                         var nextToken = argmaxLastPosition(logits)
                         generatedIds += nextToken
 
-                        // Update past cache from output tensors directly into pooled arrays
+                        // Update past cache from output tensors directly into pooled direct buffers
                         val newTotalLen = pastLen + sequenceLength
                         for (layer in CONV_LAYERS) {
-                            outputs.getValue("present_conv.$layer").floatBuffer.get(convPool.get(layer))
+                            val t = result[outBindings.convIndices[layer]] as OnnxTensor
+                            val dst = convPool.get(layer)
+                            val src = t.floatBuffer
+                            src.position(0)
+                            dst.position(0)
+                            dst.put(src)
+                            dst.clear()
                         }
                         for (layer in KV_LAYERS) {
-                            kvPool.getKey(layer).updateFrom(outputs.getValue("present.$layer.key"), newTotalLen)
-                            kvPool.getValue(layer).updateFrom(outputs.getValue("present.$layer.value"), newTotalLen)
+                            val keyTensor = result[outBindings.kvKeyIndices[layer]] as OnnxTensor
+                            val valTensor = result[outBindings.kvValIndices[layer]] as OnnxTensor
+                            kvPool.getKey(layer).updateFrom(keyTensor, newTotalLen)
+                            kvPool.getValue(layer).updateFrom(valTensor, newTotalLen)
                         }
                         val extractNs = System.nanoTime()
 
@@ -351,10 +450,12 @@ assert(result === 2, "1 + 1 应该等于 2");
                             )
                         }
 
-                        // Detect and execute JavaScript tool call if emitted by model
-                        val hasToolCallEnd = lastDecodeText.contains("</tool_call>") ||
-                                lastDecodeText.contains("</run_javascript>") ||
-                                lastDecodeText.contains("</function>")
+                        // Fast probe before scanning full text for tool call tags
+                        val hasToolCallEnd = lastDecodeText.length > lastExecutedToolEnd &&
+                                (lastDecodeText.endsWith('>') || lastDecodeText.takeLast(32).contains("</")) &&
+                                (lastDecodeText.contains("</tool_call>") ||
+                                 lastDecodeText.contains("</run_javascript>") ||
+                                 lastDecodeText.contains("</function>"))
                         if (enableTools && toolExecutionCount < maxToolCalls && hasToolCallEnd) {
                             val toolCall = LfmToolCallParser.findNextToolCall(lastDecodeText, fromIndex = lastExecutedToolEnd)
                             if (toolCall != null && toolCall.code.isNotBlank()) {
@@ -377,19 +478,40 @@ assert(result === 2, "1 + 1 应该等于 2");
                                     // Batch Prefill: Ingest all tool response tokens into model KV cache in a single forward pass
                                     val respLen = respIds.size
                                     val currentPast = pastLen + sequenceLength
-                                    val feedInputs = LinkedHashMap<String, OnnxTensor>()
-                                    val feedOwned = ArrayList<OnnxTensor>()
+                                    val feedInputs = LinkedHashMap<String, OnnxTensor>(64)
+                                    val feedOwned = ArrayList<OnnxTensor>(48)
                                     try {
                                         val feedMaskLen = currentPast + respLen
-                                        val feedMaskBuffer = if (feedMaskLen <= staticAllOnesMask.size) {
-                                            LongBuffer.wrap(staticAllOnesMask, 0, feedMaskLen)
+                                        val feedMaskBuffer = if (feedMaskLen <= staticAllOnesBuffer.capacity()) {
+                                            val b = staticAllOnesBuffer.duplicate()
+                                            b.position(0)
+                                            b.limit(feedMaskLen)
+                                            b
                                         } else {
                                             LongBuffer.wrap(LongArray(feedMaskLen) { 1L })
                                         }
-                                        feedInputs["input_ids"] = longTensor(respIds.map { it.toLong() }.toLongArray(), longArrayOf(1, respLen.toLong()), feedOwned)
+                                        val feedPosBuf = if (respLen <= posDirectBuffer.capacity()) {
+                                            posDirectBuffer.clear()
+                                            for (i in 0 until respLen) posDirectBuffer.put((currentPast + i).toLong())
+                                            posDirectBuffer.flip()
+                                            posDirectBuffer.duplicate()
+                                        } else {
+                                            LongBuffer.wrap(LongArray(respLen) { (currentPast + it).toLong() })
+                                        }
+                                        val feedInputBuf = if (respLen <= inputIdDirectBuffer.capacity()) {
+                                            inputIdDirectBuffer.clear()
+                                            for (id in respIds) inputIdDirectBuffer.put(id.toLong())
+                                            inputIdDirectBuffer.flip()
+                                            inputIdDirectBuffer.duplicate()
+                                        } else {
+                                            LongBuffer.wrap(respIds.map { it.toLong() }.toLongArray())
+                                        }
+                                        val feedLogitsToKeep = logitsToKeepBuffer.duplicate().apply { position(0); limit(1) }
+
+                                        feedInputs["input_ids"] = longTensor(feedInputBuf, longArrayOf(1, respLen.toLong()), feedOwned)
                                         feedInputs["attention_mask"] = longTensor(feedMaskBuffer, longArrayOf(1, feedMaskLen.toLong()), feedOwned)
-                                        feedInputs["position_ids"] = longTensor(LongArray(respLen) { (currentPast + it).toLong() }, longArrayOf(1, respLen.toLong()), feedOwned)
-                                        feedInputs["logits_to_keep"] = longTensor(longArrayOf(1L), longArrayOf(1), feedOwned)
+                                        feedInputs["position_ids"] = longTensor(feedPosBuf, longArrayOf(1, respLen.toLong()), feedOwned)
+                                        feedInputs["logits_to_keep"] = longTensor(feedLogitsToKeep, longArrayOf(1), feedOwned)
 
                                         for (l in CONV_LAYERS) {
                                             feedInputs["past_conv.$l"] = floatTensor(
@@ -410,16 +532,24 @@ assert(result === 2, "1 + 1 应该等于 2");
 
                                         val toolPrefillStartNs = System.nanoTime()
                                         s.run(feedInputs, runOptions).use { feedRes ->
-                                            val outMap = s.outputNames.associateWith { name -> feedRes[s.outputNames.indexOf(name)] as OnnxTensor }
                                             val updatedPastLen = currentPast + respLen
                                             for (l in CONV_LAYERS) {
-                                                outMap.getValue("present_conv.$l").floatBuffer.get(convPool.get(l))
+                                                val t = feedRes[outBindings.convIndices[l]] as OnnxTensor
+                                                val dst = convPool.get(l)
+                                                val src = t.floatBuffer
+                                                src.position(0)
+                                                dst.position(0)
+                                                dst.put(src)
+                                                dst.clear()
                                             }
                                             for (l in KV_LAYERS) {
-                                                kvPool.getKey(l).updateFrom(outMap.getValue("present.$l.key"), updatedPastLen)
-                                                kvPool.getValue(l).updateFrom(outMap.getValue("present.$l.value"), updatedPastLen)
+                                                val keyTensor = feedRes[outBindings.kvKeyIndices[l]] as OnnxTensor
+                                                val valTensor = feedRes[outBindings.kvValIndices[l]] as OnnxTensor
+                                                kvPool.getKey(l).updateFrom(keyTensor, updatedPastLen)
+                                                kvPool.getValue(l).updateFrom(valTensor, updatedPastLen)
                                             }
-                                            nextToken = argmaxLastPosition(outMap.getValue("logits"))
+                                            val feedLogits = feedRes[outBindings.logitsIndex] as OnnxTensor
+                                            nextToken = argmaxLastPosition(feedLogits)
                                         }
                                         val toolPrefillMs = (System.nanoTime() - toolPrefillStartNs) / 1_000_000.0
                                         LfmChatLogger.info("TOOL_BATCH_PREFILL tokens=$respLen timeMs=${String.format("%.1f", toolPrefillMs)}ms speed=${String.format("%.1f", respLen * 1000.0 / toolPrefillMs.coerceAtLeast(1.0))}tok/s")
@@ -450,6 +580,11 @@ assert(result === 2, "1 + 1 应该等于 2");
                 inputIds = mutableListOf(generatedIds.last())
             }
         } finally {
+            runCatching {
+                if (wakeLock?.isHeld == true) {
+                    wakeLock.release()
+                }
+            }
             runOptions.close()
         }
 
@@ -490,6 +625,7 @@ assert(result === 2, "1 + 1 应该等于 2");
     fun stop() = synchronized(lock) {
         runCatching { session?.close() }
         session = null
+        outputBindings = null
     }
 
     /** Mirrors the model's chat template, stripping old thinking and opening reasoning prompt. */
@@ -524,11 +660,17 @@ assert(result === 2, "1 + 1 应该等于 2");
         val shape = tensor.info.shape
         val vocab = shape[shape.size - 1].toInt()
         val b = tensor.floatBuffer
+        b.position(b.limit() - vocab)
         var best = Float.NEGATIVE_INFINITY
         var bestIndex = 0
-        for (i in 0 until vocab) {
-            val v = b.get(b.limit() - vocab + i)
-            if (v > best) { best = v; bestIndex = i }
+        var i = 0
+        while (i < vocab) {
+            val v = b.get()
+            if (v > best) {
+                best = v
+                bestIndex = i
+            }
+            i++
         }
         return bestIndex
     }

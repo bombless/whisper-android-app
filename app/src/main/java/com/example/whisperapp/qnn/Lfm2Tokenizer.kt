@@ -2,6 +2,7 @@ package com.example.whisperapp.qnn
 
 import android.content.res.AssetManager
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.InputStream
 import java.util.Locale
@@ -110,15 +111,16 @@ class LfmTokenizer private constructor(
     }
 
     /**
-     * Efficient stateful streaming decoder that avoids O(N^2) full-sequence re-decoding.
+     * Efficient stateful streaming decoder that avoids O(N^2) full-sequence re-decoding
+     * and uses unboxed primitive byte streaming.
      */
     inner class StreamDecoder {
-        private val rawBytes = ArrayList<Byte>(1024)
+        private val buffer = ByteArrayOutputStream(1024)
 
         fun append(id: Int): String {
             val bytes = tokenBytes(id)
             if (bytes != null) {
-                for (b in bytes) rawBytes.add(b)
+                buffer.write(bytes)
             }
             return text()
         }
@@ -127,16 +129,14 @@ class LfmTokenizer private constructor(
             for (id in ids) {
                 val bytes = tokenBytes(id)
                 if (bytes != null) {
-                    for (b in bytes) rawBytes.add(b)
+                    buffer.write(bytes)
                 }
             }
             return text()
         }
 
         fun text(): String {
-            val arr = ByteArray(rawBytes.size)
-            for (i in 0 until rawBytes.size) arr[i] = rawBytes[i]
-            return arr.toString(Charsets.UTF_8)
+            return buffer.toString(Charsets.UTF_8.name())
         }
     }
 

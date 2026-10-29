@@ -1,6 +1,8 @@
 package com.example.whisperapp.ui
 
+import android.app.Activity
 import android.util.Log
+import android.view.WindowManager
 import android.widget.Toast
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
@@ -53,6 +55,18 @@ fun ChatScreen(modifier: Modifier = Modifier) {
         status = QnnLfm2ChatRunner.start(context).message
     }
 
+    val activity = context as? Activity
+    DisposableEffect(busy) {
+        if (busy) {
+            activity?.window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            activity?.window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+        onDispose {
+            activity?.window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+    }
+
     DisposableEffect(Unit) {
         onDispose {
             QnnLfm2ChatRunner.cancelGeneration()
@@ -80,6 +94,8 @@ fun ChatScreen(modifier: Modifier = Modifier) {
 
             Log.i("CHAT_UI", "SEND chars=${text.length} maxTokens=$maxTokens history=${historySnapshot.size}")
             currentJob = scope.launch(Dispatchers.Default) {
+                var lastUiUpdateNs = 0L
+                val uiThrottleNs = 60_000_000L // 60ms throttle
                 val answer = runCatching {
                     QnnLfm2ChatRunner.generate(
                         context = context,
@@ -87,9 +103,14 @@ fun ChatScreen(modifier: Modifier = Modifier) {
                         maxTokens = maxTokens,
                         isCancelled = { !isActive }
                     ) { partialText ->
-                        launch(Dispatchers.Main) {
-                            if (assistantIndex in messages.indices) {
-                                messages[assistantIndex] = "assistant" to partialText
+                        val now = System.nanoTime()
+                        val isBoundary = partialText.endsWith('\n') || partialText.endsWith('。') || partialText.endsWith('！') || partialText.endsWith('？') || partialText.endsWith("```")
+                        if (isBoundary || now - lastUiUpdateNs >= uiThrottleNs) {
+                            lastUiUpdateNs = now
+                            launch(Dispatchers.Main) {
+                                if (assistantIndex in messages.indices) {
+                                    messages[assistantIndex] = "assistant" to partialText
+                                }
                             }
                         }
                     }
@@ -110,7 +131,7 @@ fun ChatScreen(modifier: Modifier = Modifier) {
     // Auto-scroll to bottom as new tokens arrive
     LaunchedEffect(messages.size, messages.lastOrNull()?.second?.length) {
         if (messages.isNotEmpty()) {
-            listState.animateScrollToItem(messages.size - 1, scrollOffset = 100000)
+            listState.scrollToItem(messages.size - 1, scrollOffset = 100000)
         }
     }
 
