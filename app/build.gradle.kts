@@ -26,7 +26,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.example.whisperapp"
+        applicationId = "io.github.bombless.htp_playpen"
         minSdk = 29
         targetSdk = 35
         versionCode = 1

@@ -79,7 +79,9 @@ object ModelManager {
 
     fun modelDir(context: Context, model: ManagedModel): File =
         if (model == ManagedModel.LFM3) {
-            File(context.filesDir, LFM3_MODEL_DIR)
+            val ext = context.getExternalFilesDir(null)?.let { File(it, LFM3_MODEL_DIR) }
+            val internal = File(context.filesDir, LFM3_MODEL_DIR)
+            if (ext != null && File(ext, "onnx/model_q4.onnx").isFile) ext else internal
         } else {
             File(
                 context.getExternalFilesDir(null) ?: context.filesDir,

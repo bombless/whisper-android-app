@@ -19,7 +19,7 @@ import onnx
 ROOT = Path(__file__).resolve().parent
 CACHE = ROOT / "downloads"
 MODEL_DIR = CACHE / "model"
-DEVICE_DIR = "/sdcard/Android/data/com.example.whisperapp/files/sdxl"
+DEVICE_DIR = "/sdcard/Android/data/io.github.bombless.htp_playpen/files/sdxl"
 MODEL_REVISION = "ead90f4635e21e7412b8200a5efd220b0193beeb"
 CLIP_REVISION = "16aee6ccb10aee640bb37c7072763ad4d090e4ca"
 ARCHIVE_SHA = "426e36987fd3b84dd05255cb12bc5463c427c8b55598bd3b2486a72291d6be7f"
@@ -91,14 +91,15 @@ def prepare(proxy: str | None) -> None:
 
 
 def deploy() -> None:
-    subprocess.run(["adb", "shell", "am", "force-stop", "com.example.whisperapp"], check=True)
-    subprocess.run(["adb", "shell", "run-as", "com.example.whisperapp", "rm", "-f",
+    pkg = "io.github.bombless.htp_playpen"
+    subprocess.run(["adb", "shell", "am", "force-stop", pkg], check=True)
+    subprocess.run(["adb", "shell", "run-as", pkg, "rm", "-f",
                     "files/sdxl-prepare-result.txt"], check=True)
-    subprocess.run(["adb", "shell", "am", "start", "-n", "com.example.whisperapp/.qnn.QnnSmokeActivity",
+    subprocess.run(["adb", "shell", "am", "start", "-n", f"{pkg}/com.example.whisperapp.qnn.QnnSmokeActivity",
                     "--ez", "sdxl_prepare", "true"], check=True)
     for _ in range(30):
         time.sleep(1)
-        report = subprocess.run(["adb", "shell", "run-as", "com.example.whisperapp", "cat",
+        report = subprocess.run(["adb", "shell", "run-as", pkg, "cat",
                                  "files/sdxl-prepare-result.txt"], capture_output=True, text=True)
         if report.returncode == 0 and report.stdout.startswith("READY:"):
             break

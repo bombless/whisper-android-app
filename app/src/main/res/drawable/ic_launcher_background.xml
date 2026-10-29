@@ -1,4 +1,38 @@
 <?xml version="1.0" encoding="utf-8"?>
-<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
-    <solid android:color="#101A35" />
-</shape>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:pathData="M0,0h108v108h-108z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:angle="315"
+                android:startX="0"
+                android:startY="0"
+                android:endX="108"
+                android:endY="108"
+                android:type="linear">
+                <item android:offset="0.0" android:color="#070C18" />
+                <item android:offset="0.5" android:color="#0B152B" />
+                <item android:offset="1.0" android:color="#0E2246" />
+            </gradient>
+        </aapt:attr>
+    </path>
+    <!-- Subtle high-tech ambient grid lines -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#1E325A"
+        android:strokeWidth="0.6"
+        android:strokeAlpha="0.4"
+        android:pathData="M20,0 L20,108 M40,0 L40,108 M68,0 L68,108 M88,0 L88,108 M0,20 L108,20 M0,40 L108,40 M0,68 L108,68 M0,88 L108,88" />
+    <!-- Ambient glow circle around center -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#00E5FF"
+        android:strokeWidth="1.0"
+        android:strokeAlpha="0.12"
+        android:pathData="M54,20 A34,34 0 1 0 54,88 A34,34 0 1 0 54,20" />
+</vector>

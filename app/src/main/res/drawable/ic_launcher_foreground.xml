@@ -1,24 +1,146 @@
 <?xml version="1.0" encoding="utf-8"?>
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
     android:width="108dp"
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
+
+    <!-- Bus circuit traces from outer corners to NPU core -->
     <path
         android:fillColor="#00000000"
-        android:strokeColor="#65E6D2"
-        android:strokeWidth="4.5"
+        android:strokeColor="#00E5FF"
+        android:strokeWidth="1.8"
+        android:strokeAlpha="0.65"
         android:strokeLineCap="round"
-        android:strokeLineJoin="round"
-        android:pathData="M54,23 C47.9,23 43,27.9 43,34 L43,51 C43,57.1 47.9,62 54,62 C60.1,62 65,57.1 65,51 L65,34 C65,27.9 60.1,23 54,23 Z" />
+        android:pathData="M54,26 L54,39 M78,40 L67,46.5 M78,68 L67,61.5 M54,82 L54,69 M30,68 L41,61.5 M30,40 L41,46.5" />
+
+    <!-- Secondary circuit accents -->
     <path
         android:fillColor="#00000000"
-        android:strokeColor="#F4F8FF"
-        android:strokeWidth="4.5"
+        android:strokeColor="#38BDF8"
+        android:strokeWidth="1.2"
+        android:strokeAlpha="0.4"
+        android:strokeLineCap="round"
+        android:pathData="M23,54 L36,54 M85,54 L72,54" />
+
+    <!-- Outer HTP Hexagon Shield / Perimeter -->
+    <path
+        android:strokeWidth="3.2"
         android:strokeLineCap="round"
         android:strokeLineJoin="round"
-        android:pathData="M34,48 L34,51 C34,62 43,71 54,71 C65,71 74,62 74,51 L74,48 M54,71 L54,82 M43,82 L65,82" />
+        android:pathData="M54,26 L78,40 L78,68 L54,82 L30,68 L30,40 Z">
+        <aapt:attr name="android:strokeColor">
+            <gradient
+                android:startX="30"
+                android:startY="26"
+                android:endX="78"
+                android:endY="82"
+                android:type="linear">
+                <item android:offset="0.0" android:color="#00F2FE" />
+                <item android:offset="0.5" android:color="#38BDF8" />
+                <item android:offset="1.0" android:color="#818CF8" />
+            </gradient>
+        </aapt:attr>
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startX="54"
+                android:startY="26"
+                android:endX="54"
+                android:endY="82"
+                android:type="linear">
+                <item android:offset="0.0" android:color="#3000E5FF" />
+                <item android:offset="1.0" android:color="#150F172A" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Outer Hexagon corner micro-nodes -->
+    <path android:fillColor="#00F2FE" android:pathData="M54,26 m-2,0 a2,2 0 1 0 4,0 a2,2 0 1 0 -4,0" />
+    <path android:fillColor="#38BDF8" android:pathData="M78,40 m-2,0 a2,2 0 1 0 4,0 a2,2 0 1 0 -4,0" />
+    <path android:fillColor="#60A5FA" android:pathData="M78,68 m-2,0 a2,2 0 1 0 4,0 a2,2 0 1 0 -4,0" />
+    <path android:fillColor="#818CF8" android:pathData="M54,82 m-2,0 a2,2 0 1 0 4,0 a2,2 0 1 0 -4,0" />
+    <path android:fillColor="#60A5FA" android:pathData="M30,68 m-2,0 a2,2 0 1 0 4,0 a2,2 0 1 0 -4,0" />
+    <path android:fillColor="#38BDF8" android:pathData="M30,40 m-2,0 a2,2 0 1 0 4,0 a2,2 0 1 0 -4,0" />
+
+    <!-- Inner NPU Processor Hexagon Core -->
     <path
-        android:fillColor="#65E6D2"
-        android:pathData="M23,42 L27,42 L27,58 L23,58 Z M30,36 L34,36 L34,64 L30,64 Z M74,36 L78,36 L78,64 L74,64 Z M81,42 L85,42 L85,58 L81,58 Z" />
+        android:strokeWidth="1.8"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M54,39 L67,46.5 L67,61.5 L54,69 L41,61.5 L41,46.5 Z">
+        <aapt:attr name="android:strokeColor">
+            <gradient
+                android:startX="41"
+                android:startY="39"
+                android:endX="67"
+                android:endY="69"
+                android:type="linear">
+                <item android:offset="0.0" android:color="#38BDF8" />
+                <item android:offset="1.0" android:color="#C084FC" />
+            </gradient>
+        </aapt:attr>
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startX="54"
+                android:startY="39"
+                android:endX="54"
+                android:endY="69"
+                android:type="linear">
+                <item android:offset="0.0" android:color="#E00B1736" />
+                <item android:offset="1.0" android:color="#E0111E48" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Neural tensor bus network (connections between 6 satellite nodes and core) -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#7DD3FC"
+        android:strokeWidth="1.2"
+        android:strokeAlpha="0.8"
+        android:pathData="M54,54 L54,45 M54,54 L62,49.5 M54,54 L62,58.5 M54,54 L54,63 M54,54 L46,58.5 M54,54 L46,49.5" />
+
+    <!-- Neural ring interconnect -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#38BDF8"
+        android:strokeWidth="0.8"
+        android:strokeAlpha="0.5"
+        android:pathData="M54,45 L62,49.5 L62,58.5 L54,63 L46,58.5 L46,49.5 Z" />
+
+    <!-- Multimodal compute satellite nodes -->
+    <!-- Voice / Whisper STT (Cyan) -->
+    <path android:fillColor="#00F2FE" android:pathData="M54,45 m-2.2,0 a2.2,2.2 0 1 0 4.4,0 a2.2,2.2 0 1 0 -4.4,0" />
+    <!-- LLM Chat (Electric Violet) -->
+    <path android:fillColor="#A78BFA" android:pathData="M62,49.5 m-2.2,0 a2.2,2.2 0 1 0 4.4,0 a2.2,2.2 0 1 0 -4.4,0" />
+    <!-- SDXL Image Gen (Rose/Pink) -->
+    <path android:fillColor="#F472B6" android:pathData="M62,58.5 m-2.2,0 a2.2,2.2 0 1 0 4.4,0 a2.2,2.2 0 1 0 -4.4,0" />
+    <!-- Speech TTS (Emerald) -->
+    <path android:fillColor="#34D399" android:pathData="M54,63 m-2.2,0 a2.2,2.2 0 1 0 4.4,0 a2.2,2.2 0 1 0 -4.4,0" />
+    <!-- Matrix Engine (Amber) -->
+    <path android:fillColor="#FBBF24" android:pathData="M46,58.5 m-2.2,0 a2.2,2.2 0 1 0 4.4,0 a2.2,2.2 0 1 0 -4.4,0" />
+    <!-- Vector Engine (Sky Blue) -->
+    <path android:fillColor="#38BDF8" android:pathData="M46,49.5 m-2.2,0 a2.2,2.2 0 1 0 4.4,0 a2.2,2.2 0 1 0 -4.4,0" />
+
+    <!-- Central NPU Tensor Radiant Core -->
+    <path android:fillColor="#67E8F9" android:pathData="M54,54 m-3.6,0 a3.6,3.6 0 1 0 7.2,0 a3.6,3.6 0 1 0 -7.2,0" />
+    <path android:fillColor="#FFFFFF" android:pathData="M54,54 m-2.0,0 a2.0,2.0 0 1 0 4.0,0 a2.0,2.0 0 1 0 -4.0,0" />
+
+    <!-- AI Sparkle 1: Top-Right (Golden Cyber Sparkle) -->
+    <path
+        android:fillColor="#FDE047"
+        android:pathData="M73,19 Q73,25 67,25 Q73,25 73,31 Q73,25 79,25 Q73,25 73,19 Z" />
+
+    <!-- AI Sparkle 2: Bottom-Left (Cyan Sparkle) -->
+    <path
+        android:fillColor="#38BDF8"
+        android:pathData="M33,71 Q33,76 28,76 Q33,76 33,81 Q33,76 38,76 Q33,76 33,71 Z" />
+
+    <!-- High-energy photon particles -->
+    <path android:fillColor="#F0FDFA" android:pathData="M79,32 m-1.2,0 a1.2,1.2 0 1 0 2.4,0 a1.2,1.2 0 1 0 -2.4,0" />
+    <path android:fillColor="#F0FDFA" android:pathData="M27,65 m-1.2,0 a1.2,1.2 0 1 0 2.4,0 a1.2,1.2 0 1 0 -2.4,0" />
+    <path android:fillColor="#67E8F9" android:pathData="M54,19 m-1.0,0 a1.0,1.0 0 1 0 2.0,0 a1.0,1.0 0 1 0 -2.0,0" />
+    <path android:fillColor="#67E8F9" android:pathData="M54,89 m-1.0,0 a1.0,1.0 0 1 0 2.0,0 a1.0,1.0 0 1 0 -2.0,0" />
+
 </vector>

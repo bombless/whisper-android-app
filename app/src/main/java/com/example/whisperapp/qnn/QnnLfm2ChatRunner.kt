@@ -206,7 +206,10 @@ assert(result === 2, "1 + 1 应该等于 2");
             val app = context.applicationContext
             LfmChatLogger.init(app)
             stage = "check_model_files"
-            val modelDir = File(app.filesDir, "models/$MODEL_DIR")
+            val modelDir = listOfNotNull(
+                File(app.filesDir, "models/$MODEL_DIR"),
+                app.getExternalFilesDir(null)?.let { File(it, "models/$MODEL_DIR") }
+            ).firstOrNull { File(it, MODEL_FILE).isFile } ?: File(app.filesDir, "models/$MODEL_DIR")
             val model = File(modelDir, MODEL_FILE)
             val data = File(modelDir, EXTERNAL_DATA_NAME)
             if (data.isFile && data.length() != EXTERNAL_DATA_SIZE) {
