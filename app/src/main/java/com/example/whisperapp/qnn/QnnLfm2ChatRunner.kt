@@ -29,23 +29,38 @@ object QnnLfmChatRunner {
     const val THINKING_PROMPT_PREFIX = "<think>让我把完整的方案想清楚再输出\n"
     const val TOOL_SYSTEM_PROMPT = """你是一个具备代码运行和自我验证能力的 AI 助手。你可以调用内置的 JavaScript 运行时工具（run_javascript）来执行并验证代码，以确保算法实现、数学计算与复杂逻辑的绝对正确性。
 
+【工具定义】
+你可以调用如下工具：
+- 工具名称: run_javascript
+- 功能说明: 执行并验证 JavaScript (ES6) 脚本，支持 console.log() 与 assert(condition, message)。
+- 参数列表:
+  - code (string, 必需): 要执行的 JavaScript 代码。
+
 【工具调用规范】
-当你需要验证算法（如红黑树、二叉树、图算法、排序、复杂数学计算等）时，请在回复中调用工具：
-1. 格式规范：在 <tool_call> 标签内直接编写 JavaScript 代码（建议使用 ```javascript 包裹）。
-2. 语法要求：代码必须为合法的 JavaScript (ES6) 脚本，可使用 console.log() 输出结果，可使用 assert(condition, message) 进行断言验证。
-3. 严禁事项：<tool_call> 内部必须直接放代码，严禁包裹 <function>、<parameter>、<xml> 等额外的 XML 标签。
-4. 执行与反馈：系统会自动执行脚本，并将控制台输出返回在 <tool_response> 中。你必须根据 <tool_response> 的测试结果输出最终正确方案。
+当你需要验证算法（如红黑树、二叉树、图算法、排序、复杂数学计算等）时，请使用原生格式调用工具：
+<tool_call>
+<function=run_javascript>
+<parameter=code>
+// 在此处编写合法的 JavaScript (ES6) 脚本
+// 可使用 console.log() 输出结果，可使用 assert(condition, message) 进行断言验证
+</parameter>
+</function>
+</tool_call>
+
+系统会自动执行脚本并将控制台输出返回在 <tool_response> 中。你必须根据 <tool_response> 的测试结果输出最终正确方案。
 
 【调用示例 (One-Shot Example)】
 用户：请验证 1 + 1 是否等于 2。
 助手：
 让我调用 JavaScript 运行时来验证这个计算：
 <tool_call>
-```javascript
+<function=run_javascript>
+<parameter=code>
 const result = 1 + 1;
 console.log("计算结果:", result);
 assert(result === 2, "1 + 1 应该等于 2");
-```
+</parameter>
+</function>
 </tool_call>
 <tool_response>
 [输出]
@@ -454,11 +469,15 @@ assert(result === 2, "1 + 1 应该等于 2");
                         }
 
                         // Fast probe before scanning full text for tool call tags
-                        val hasToolCallEnd = lastDecodeText.length > lastExecutedToolEnd &&
-                                (lastDecodeText.endsWith('>') || lastDecodeText.takeLast(32).contains("</")) &&
-                                (lastDecodeText.contains("</tool_call>") ||
-                                 lastDecodeText.contains("</run_javascript>") ||
-                                 lastDecodeText.contains("</function>"))
+                        val activeSub = if (lastExecutedToolEnd < lastDecodeText.length) lastDecodeText.substring(lastExecutedToolEnd) else ""
+                        val hasToolCallEnd = activeSub.isNotEmpty() &&
+                                (activeSub.endsWith('>') || activeSub.takeLast(32).contains("</")) &&
+                                (
+                                    activeSub.contains("</tool_call>") ||
+                                    activeSub.contains("</run_javascript>") ||
+                                    (!activeSub.contains("<tool_call") && activeSub.contains("</function>")) ||
+                                    (activeSub.contains("</function>") && activeSub.substringAfterLast("</function>").length > 20)
+                                )
                         if (enableTools && toolExecutionCount < maxToolCalls && hasToolCallEnd) {
                             val toolCall = LfmToolCallParser.findNextToolCall(lastDecodeText, fromIndex = lastExecutedToolEnd)
                             if (toolCall != null && toolCall.code.isNotBlank()) {

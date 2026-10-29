@@ -141,4 +141,79 @@ class MarkdownRendererTest {
         assertTrue(blocks[2] is ChatMessageBlock.TextBlock)
         assertTrue((blocks[2] as ChatMessageBlock.TextBlock).content.contains("测试表明红黑树插入成功"))
     }
+
+    @Test
+    fun testNativeLfm3XmlToolCallRenderingWithoutXmlLeakage() {
+        val message = """
+            让我用 JavaScript 编写并测试红黑树：
+            <tool_call>
+            <function=run_javascript>
+            <parameter=code>
+            const tree = new RedBlackTree();
+            tree.insert(10);
+            console.log("Root:", tree.root.key);
+            </parameter>
+            </function>
+            </tool_call>
+            <tool_response>
+            [输出]
+            Root: 10
+            [返回值] undefined
+            </tool_response>
+            测试表明红黑树插入成功，黑色高度平衡！
+        """.trimIndent()
+
+        val blocks = parseMarkdownBlocks(message)
+        assertEquals(3, blocks.size)
+        assertTrue(blocks[0] is ChatMessageBlock.TextBlock)
+        assertTrue((blocks[0] as ChatMessageBlock.TextBlock).content.contains("让我用 JavaScript 编写并测试红黑树"))
+
+        assertTrue(blocks[1] is ChatMessageBlock.ToolExecutionBlock)
+        val toolBlock = blocks[1] as ChatMessageBlock.ToolExecutionBlock
+        assertEquals("JavaScript 运行时", toolBlock.toolName)
+        assertTrue("Tool block code should contain tree insert", toolBlock.code.contains("tree.insert(10);"))
+        assertTrue("Tool block code MUST NOT contain <function>", !toolBlock.code.contains("<function"))
+        assertTrue("Tool block code MUST NOT contain <parameter>", !toolBlock.code.contains("<parameter"))
+        assertTrue("Tool block code MUST NOT contain </function>", !toolBlock.code.contains("</function"))
+        assertTrue("Tool block code MUST NOT contain </parameter>", !toolBlock.code.contains("</parameter"))
+        assertNotNull(toolBlock.response)
+        assertTrue("Tool response should contain Root: 10", toolBlock.response?.contains("Root: 10") == true)
+        assertTrue("Tool response MUST NOT contain <tool_response>", toolBlock.response?.contains("<tool_response>") == false)
+        assertEquals(false, toolBlock.isRunning)
+
+        assertTrue(blocks[2] is ChatMessageBlock.TextBlock)
+        val textBlock = blocks[2] as ChatMessageBlock.TextBlock
+        assertTrue(textBlock.content.contains("测试表明红黑树插入成功"))
+        assertTrue("TextBlock MUST NOT contain </tool_call>", !textBlock.content.contains("</tool_call>"))
+        assertTrue("TextBlock MUST NOT contain <tool_response>", !textBlock.content.contains("<tool_response>"))
+        assertTrue("TextBlock MUST NOT contain </tool_response>", !textBlock.content.contains("</tool_response>"))
+    }
+
+    @Test
+    fun testStreamingNativeXmlToolCallNoLeakage() {
+        val streamingMessage = "让我写个算法：\n<tool_call>\n<function=run_javascript>\n<parameter=code>\nconst x = 123;"
+        val blocks = parseMarkdownBlocks(streamingMessage)
+        assertEquals(2, blocks.size)
+        assertTrue(blocks[0] is ChatMessageBlock.TextBlock)
+        assertTrue(blocks[1] is ChatMessageBlock.ToolExecutionBlock)
+
+        val toolBlock = blocks[1] as ChatMessageBlock.ToolExecutionBlock
+        assertEquals("const x = 123;", toolBlock.code)
+        assertTrue("Must not contain <function>", !toolBlock.code.contains("<function"))
+        assertTrue("Must not contain <parameter>", !toolBlock.code.contains("<parameter"))
+        assertEquals(true, toolBlock.isRunning)
+        assertEquals(null, toolBlock.response)
+    }
+
+    @Test
+    fun testStrayXmlTagSanitizationInText() {
+        val textWithStrayTags = "执行完成，包含 </function>\n</tool_call>\n<tool_response> 标签，应该被过滤"
+        val blocks = parseMarkdownBlocks(textWithStrayTags)
+        val text = blocks.filterIsInstance<ChatMessageBlock.TextBlock>().joinToString("\n") { it.content }
+        assertTrue("Stray tag </function> should be sanitized", !text.contains("</function>"))
+        assertTrue("Stray tag </tool_call> should be sanitized", !text.contains("</tool_call>"))
+        assertTrue("Stray tag <tool_response> should be sanitized", !text.contains("<tool_response>"))
+        assertTrue(text.contains("执行完成"))
+        assertTrue(text.contains("应该被过滤"))
+    }
 }

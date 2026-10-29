@@ -55,6 +55,27 @@ sealed interface ChatMessageBlock {
  * Parses markdown text into structured blocks (Code blocks, tool executions, headings, lists, quotes, paragraphs).
  * Supports partial/streaming markdown safely.
  */
+private val STRAY_XML_REGEX = Regex(
+    """</?(?:tool_call(?::[a-zA-Z0-9_-]+)?|run_javascript|function(?:=[a-zA-Z0-9_-]+)?|parameter(?:=[a-zA-Z0-9_-]+)?|tool_response|tools|additional_tools)(?:\s*[^>]*)?>""",
+    RegexOption.IGNORE_CASE
+)
+
+private val TOOL_CALL_BLOCK_PATTERN = Regex(
+    """(?:<tool_call(?::([a-zA-Z0-9_-]+))?>([\s\S]*?)(?:</tool_call(?::\1)?>|$))""" +
+    """|(?:<run_javascript>([\s\S]*?)(?:</run_javascript>|$))""" +
+    """|(?:<function(?:=([a-zA-Z0-9_-]+))?>([\s\S]*?)(?:</function>|$))""",
+    RegexOption.IGNORE_CASE
+)
+
+private val TOOL_RESPONSE_BLOCK_PATTERN = Regex(
+    """\s*<tool_response>([\s\S]*?)(?:</tool_response>|$)""",
+    RegexOption.IGNORE_CASE
+)
+
+/**
+ * Parses markdown text into structured blocks (Code blocks, tool executions, headings, lists, quotes, paragraphs).
+ * Supports partial/streaming markdown safely with zero XML tag leakage.
+ */
 fun parseMarkdownBlocks(rawText: String): List<ChatMessageBlock> {
     if (!rawText.contains("<tool_call", ignoreCase = true) &&
         !rawText.contains("<run_javascript", ignoreCase = true) &&
@@ -63,20 +84,13 @@ fun parseMarkdownBlocks(rawText: String): List<ChatMessageBlock> {
     }
 
     val blocks = mutableListOf<ChatMessageBlock>()
-    val toolCallPattern = Regex(
-        """<(?:tool_call(?::([a-zA-Z0-9_-]+))?|run_javascript|function(?:=([a-zA-Z0-9_-]+))?)>([\s\S]*?)(?:</(?:tool_call(?::\1)?|run_javascript|function)>|$)""",
-        RegexOption.IGNORE_CASE
-    )
-    val toolResponsePattern = Regex(
-        """\s*<tool_response>([\s\S]*?)(?:</tool_response>|$)""",
-        RegexOption.IGNORE_CASE
-    )
-
     var cursor = 0
-    val matches = toolCallPattern.findAll(rawText).toList()
+    val matches = TOOL_CALL_BLOCK_PATTERN.findAll(rawText).toList()
 
     for (match in matches) {
         val start = match.range.first
+        if (start < cursor) continue
+
         if (start > cursor) {
             val prefix = rawText.substring(cursor, start).trim()
             if (prefix.isNotEmpty()) {
@@ -84,29 +98,55 @@ fun parseMarkdownBlocks(rawText: String): List<ChatMessageBlock> {
             }
         }
 
-        val toolName = match.groupValues.getOrNull(1)?.takeIf { it.isNotBlank() }
-            ?: match.groupValues.getOrNull(2)?.takeIf { it.isNotBlank() }
-            ?: "JavaScript 运行时"
-        val rawCode = match.groupValues.getOrNull(3) ?: ""
+        val g1 = match.groupValues.getOrNull(1)?.takeIf { it.isNotBlank() }
+        val g2 = match.groupValues.getOrNull(2)
+        val g3 = match.groupValues.getOrNull(3)
+        val g4 = match.groupValues.getOrNull(4)?.takeIf { it.isNotBlank() }
+        val g5 = match.groupValues.getOrNull(5)
+
+        val rawCode: String
+        val toolName: String
+        val isClosed: Boolean
+
+        when {
+            g2 != null -> {
+                // <tool_call>...</tool_call>
+                rawCode = g2
+                val extractedName = Regex("""<function(?:\s*=\s*([a-zA-Z0-9_-]+)|\s+name="?([a-zA-Z0-9_-]+)"?)""", RegexOption.IGNORE_CASE)
+                    .find(rawCode)?.let { it.groupValues[1].ifEmpty { it.groupValues[2] } }
+                toolName = g1 ?: extractedName ?: "JavaScript 运行时"
+                isClosed = match.value.contains("</tool_call", ignoreCase = true)
+            }
+            g3 != null -> {
+                // <run_javascript>...</run_javascript>
+                rawCode = g3
+                toolName = "JavaScript 运行时"
+                isClosed = match.value.contains("</run_javascript", ignoreCase = true)
+            }
+            else -> {
+                // <function=...>...</function>
+                rawCode = g5 ?: ""
+                toolName = g4 ?: "JavaScript 运行时"
+                isClosed = match.value.contains("</function", ignoreCase = true)
+            }
+        }
+
         val code = LfmToolCallParser.extractCode(rawCode)
 
-        var afterToolCall = rawText.substring(match.range.last + 1)
-        val responseMatch = toolResponsePattern.find(afterToolCall)
+        val afterToolCall = rawText.substring(match.range.last + 1)
+        val responseMatch = TOOL_RESPONSE_BLOCK_PATTERN.find(afterToolCall)
         val response = if (responseMatch != null && responseMatch.range.first == 0) {
             cursor = match.range.last + 1 + responseMatch.range.last + 1
-            responseMatch.groupValues[1].trim()
+            responseMatch.groupValues[1].replace(STRAY_XML_REGEX, "").trim()
         } else {
             cursor = match.range.last + 1
             null
         }
 
-        val isClosed = match.value.contains("</tool_call", ignoreCase = true) ||
-                match.value.contains("</run_javascript", ignoreCase = true) ||
-                match.value.contains("</function", ignoreCase = true)
         val isRunning = response == null && !isClosed
         blocks.add(
             ChatMessageBlock.ToolExecutionBlock(
-                toolName = toolName,
+                toolName = if (toolName == "run_javascript") "JavaScript 运行时" else toolName,
                 code = code,
                 response = response,
                 isRunning = isRunning
@@ -125,8 +165,11 @@ fun parseMarkdownBlocks(rawText: String): List<ChatMessageBlock> {
 }
 
 private fun parseStandardMarkdownBlocks(rawText: String): List<ChatMessageBlock> {
+    val sanitized = rawText.replace(STRAY_XML_REGEX, "").trim()
+    if (sanitized.isEmpty()) return emptyList()
+
     val blocks = mutableListOf<ChatMessageBlock>()
-    val lines = rawText.lines()
+    val lines = sanitized.lines()
     var i = 0
     val textAccumulator = StringBuilder()
 

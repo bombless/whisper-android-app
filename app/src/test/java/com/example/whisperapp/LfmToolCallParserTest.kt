@@ -150,4 +150,34 @@ class LfmToolCallParserTest {
         assertTrue(result.success)
         assertTrue(result.stdout.contains("hello from standalone"))
     }
+
+    @Test
+    fun testNativeLfm3XmlToolCallParsing() {
+        val text = """
+            <tool_call>
+            <function=run_javascript>
+            <parameter=code>
+            const a = 10;
+            const b = 20;
+            console.log(a + b);
+            </parameter>
+            </function>
+            </tool_call>
+        """.trimIndent()
+        val call = LfmToolCallParser.findNextToolCall(text)
+        assertNotNull(call)
+        assertEquals("run_javascript", call?.name)
+        assertEquals("const a = 10;\nconst b = 20;\nconsole.log(a + b);", call?.code)
+    }
+
+    @Test
+    fun testStreamingUnclosedXmlCodeExtraction() {
+        val streamingText = "<function=run_javascript>\n<parameter=code>\nconst x = 42;"
+        val extracted = LfmToolCallParser.extractCode(streamingText)
+        assertEquals("const x = 42;", extracted)
+
+        val streamingWithClosing = "<function=run_javascript>\n<parameter=code>\nconst x = 42;\n</par"
+        val extracted2 = LfmToolCallParser.extractCode(streamingWithClosing)
+        assertEquals("const x = 42;", extracted2)
+    }
 }

@@ -38,8 +38,16 @@ object LfmToolCallParser {
         // 1. Try standard <tool_call>...</tool_call>
         val match = TOOL_CALL_REGEX.find(sub)
         if (match != null) {
-            val toolName = match.groupValues.getOrNull(1)?.takeIf { it.isNotBlank() } ?: "run_javascript"
             val content = match.groupValues.getOrNull(2) ?: ""
+            val extractedName = Regex(
+                """<function(?:\s*=\s*([a-zA-Z0-9_-]+)|\s+name="?([a-zA-Z0-9_-]+)"?)""",
+                RegexOption.IGNORE_CASE
+            ).find(content)?.let { m ->
+                m.groupValues[1].takeIf { it.isNotBlank() } ?: m.groupValues[2].takeIf { it.isNotBlank() }
+            }
+            val toolName = match.groupValues.getOrNull(1)?.takeIf { it.isNotBlank() }
+                ?: extractedName
+                ?: "run_javascript"
             val code = extractCode(content)
             return ParsedToolCall(
                 name = toolName,
@@ -86,6 +94,7 @@ object LfmToolCallParser {
      * Extracts pure JavaScript code from tool call contents,
      * robustly stripping pseudo-XML wrappers (<function>, <parameter>, <code>, <script>),
      * markdown code fences (```javascript ... ```), CDATA blocks, and JSON formats.
+     * Supports both complete blocks and in-progress streaming tokens with zero XML leakage.
      */
     fun extractCode(content: String): String {
         var text = content.trim()
@@ -117,25 +126,31 @@ object LfmToolCallParser {
             }
         }
 
-        // 2. Unwrap outer <function...> ... </function> if present
+        // 2. Unwrap <function...> ... </function> (or strip leading unclosed <function...>)
         val functionRegex = Regex("""<function(?:\s*=[^>]+|\s+[^>]+)?>([\s\S]*?)</function>""", RegexOption.IGNORE_CASE)
         val funcMatch = functionRegex.find(text)
         if (funcMatch != null) {
             text = funcMatch.groupValues[1].trim()
+        } else {
+            text = text.replace(Regex("""^\s*<function(?:\s*=[^>]*|\s+[^>]*)?>?""", RegexOption.IGNORE_CASE), "").trim()
         }
 
-        // 3. Extract from <parameter...> ... </parameter> or <param...> ... </param> or <arg...> ... </arg>
+        // 3. Extract from <parameter...> ... </parameter> (or strip leading unclosed <parameter...>)
         val paramRegex = Regex("""<(?:parameter|param|arg|argument)(?:\s*=[^>]+|\s+[^>]+)?>([\s\S]*?)</(?:parameter|param|arg|argument)>""", RegexOption.IGNORE_CASE)
         val paramMatch = paramRegex.find(text)
         if (paramMatch != null) {
             text = paramMatch.groupValues[1].trim()
+        } else {
+            text = text.replace(Regex("""^\s*<(?:parameter|param|arg|argument)(?:\s*=[^>]*|\s+[^>]*)?>?""", RegexOption.IGNORE_CASE), "").trim()
         }
 
-        // 4. Extract from markdown code fence ```javascript ... ``` or ```js ... ``` or ``` ... ```
+        // 4. Extract from markdown code fence ```javascript ... ``` (or strip opening fence if streaming)
         val codeFenceRegex = Regex("""```(?:javascript|js)?\s*([\s\S]*?)```""", RegexOption.IGNORE_CASE)
         val fenceMatch = codeFenceRegex.find(text)
         if (fenceMatch != null) {
             text = fenceMatch.groupValues[1].trim()
+        } else {
+            text = text.replace(Regex("""^\s*```(?:javascript|js)?\s*""", RegexOption.IGNORE_CASE), "").trim()
         }
 
         // 5. Extract from <code>...</code> or <script>...</script> or <javascript>...</javascript>
@@ -143,16 +158,24 @@ object LfmToolCallParser {
         val tagMatch = codeTagRegex.find(text)
         if (tagMatch != null) {
             text = tagMatch.groupValues[1].trim()
+        } else {
+            text = text.replace(Regex("""^\s*<(?:code|script|javascript)>""", RegexOption.IGNORE_CASE), "").trim()
         }
 
         // 6. Strip CDATA: <![CDATA[ ... ]]>
-        val cdataRegex = Regex("""<!\[CDATA\[([\s\S]*?)\]\]>""", RegexOption.IGNORE_CASE)
-        val cdataMatch = cdataRegex.find(text)
-        if (cdataMatch != null) {
-            text = cdataMatch.groupValues[1].trim()
+        text = text.replace(Regex("""<!\[CDATA\[""", RegexOption.IGNORE_CASE), "")
+        text = text.replace(Regex("""\]\]>""", RegexOption.IGNORE_CASE), "")
+
+        // 7. Strip trailing closing tags or partial closing tags during streaming
+        while (true) {
+            val before = text
+            text = text.replace(Regex("""</(?:parameter|param|arg|argument|function|tool_call|run_javascript|code|script)>\s*$""", RegexOption.IGNORE_CASE), "").trim()
+            text = text.replace(Regex("""</[a-zA-Z0-9_-]*$""", RegexOption.IGNORE_CASE), "").trim()
+            text = text.replace(Regex("""```$"""), "").trim()
+            if (text == before) break
         }
 
-        // 7. If text is still wrapped in stray XML tags (e.g. <tool>...</tool> or <xml>...</xml>)
+        // 8. If text is still wrapped in stray XML tags (e.g. <tool>...</tool> or <xml>...</xml>)
         val outerTagRegex = Regex("""^<([a-zA-Z0-9_-]+)(?:=[^>]+|\s+[^>]+)?>([\s\S]*?)</\1>$""", RegexOption.IGNORE_CASE)
         val outerMatch = outerTagRegex.find(text)
         if (outerMatch != null) {
