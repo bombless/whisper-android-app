@@ -353,15 +353,32 @@ fun MainScreen() {
             Modifier
                 .fillMaxSize()
                 .windowInsetsPadding(WindowInsets.safeDrawing)
-                .padding(horizontal = 20.dp)
         ) {
-            TabRow(selectedTabIndex = selectedTab, modifier = Modifier.padding(0.dp)) {
-                Tab(selected = selectedTab == 0, enabled = !imageBusy, onClick = { switchToTab(0) }, text = { Text("文生语音", fontSize = 12.sp, maxLines = 1, softWrap = false) })
-                Tab(selected = selectedTab == 1, enabled = !imageBusy, onClick = { switchToTab(1) }, text = { Text("语音生文", fontSize = 12.sp, maxLines = 1, softWrap = false) })
-                Tab(selected = selectedTab == 2, enabled = !imageBusy, onClick = { switchToTab(2) }, text = { Text("聊天", fontSize = 12.sp, maxLines = 1, softWrap = false) })
-                Tab(selected = selectedTab == 3, enabled = !imageBusy, onClick = { switchToTab(3) }, text = { Text("文生图", fontSize = 12.sp, maxLines = 1, softWrap = false) })
+            TabRow(
+                selectedTabIndex = selectedTab,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp)
+            ) {
+                val tabTitles = listOf("文生语音", "语音生文", "聊天", "文生图")
+                tabTitles.forEachIndexed { index, title ->
+                    Tab(
+                        selected = selectedTab == index,
+                        enabled = !imageBusy,
+                        onClick = { switchToTab(index) },
+                        selectedContentColor = MaterialTheme.colorScheme.primary,
+                        unselectedContentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                    ) {
+                        Text(
+                            text = title,
+                            fontSize = 13.sp,
+                            fontWeight = if (selectedTab == index) FontWeight.SemiBold else FontWeight.Normal,
+                            maxLines = 1,
+                            softWrap = false,
+                            modifier = Modifier.padding(horizontal = 2.dp, vertical = 12.dp)
+                        )
+                    }
+                }
             }
-            Spacer(Modifier.height(20.dp))
+            Spacer(Modifier.height(10.dp))
             // The scroll lives inside the TTS/STT panes only: scrolling the whole box gave the
             // chat pane an unbounded height, which collapsed its weighted message list to ~0 dp.
             Box(
@@ -370,7 +387,7 @@ fun MainScreen() {
                     .fillMaxWidth()
             ) {
             if (selectedTab == 0) {
-                Column(Modifier.fillMaxWidth().verticalScroll(contentScrollState), verticalArrangement = Arrangement.spacedBy(20.dp)) {
+                Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp).verticalScroll(contentScrollState), verticalArrangement = Arrangement.spacedBy(20.dp)) {
                     Column(Modifier.fillMaxWidth()) {
                         Text("文字转语音", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.SemiBold)
                         Spacer(Modifier.height(8.dp))
@@ -414,7 +431,7 @@ fun MainScreen() {
                     ) { Text("播放语音") }
                 }
             } else if (selectedTab == 1) {
-                Column(Modifier.fillMaxWidth().verticalScroll(contentScrollState), verticalArrangement = Arrangement.spacedBy(20.dp)) {
+                Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp).verticalScroll(contentScrollState), verticalArrangement = Arrangement.spacedBy(20.dp)) {
                     Column(Modifier.fillMaxWidth()) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Box(Modifier.size(12.dp).background(if (recording) Color(0xFF42A85F) else MaterialTheme.colorScheme.outline, CircleShape))
@@ -453,10 +470,12 @@ fun MainScreen() {
             } else if (selectedTab == 2) {
                 ChatScreen(Modifier.fillMaxSize())
             } else {
-                ImageGenScreen(imageBitmap, imageStatus, imageBusy, ::generateImage) { imageJob?.cancel() }
+                Box(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
+                    ImageGenScreen(imageBitmap, imageStatus, imageBusy, ::generateImage) { imageJob?.cancel() }
+                }
             }
             }
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Start) {
+            Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), horizontalArrangement = Arrangement.Start) {
                 TextButton(enabled = !imageBusy, onClick = { showConfig = true }) { Text("⚙ 配置") }
             }
         }
