@@ -24,19 +24,32 @@ object QnnLfmChatRunner {
     private const val EXTERNAL_DATA_SIZE = 1_625_944_064L
     const val DEFAULT_MAX_TOKENS = 4096
     const val THINKING_PROMPT_PREFIX = "<think>让我把完整的方案想清楚再输出\n"
-    const val TOOL_SYSTEM_PROMPT = """你是一个具备代码运行和自我验证能力的 AI 助手。你可以调用内置的 JavaScript 运行时工具来运行和测试代码，以确保算法和代码实现的绝对正确性。
+    const val TOOL_SYSTEM_PROMPT = """你是一个具备代码运行和自我验证能力的 AI 助手。你可以调用内置的 JavaScript 运行时工具（run_javascript）来执行并验证代码，以确保算法实现、数学计算与复杂逻辑的绝对正确性。
 
-【工具调用规则】
-当你需要验证算法（例如红黑树、二叉搜索树、图算法、排序、复杂数学计算等）时，请在回复中调用工具：
+【工具调用规范】
+当你需要验证算法（如红黑树、二叉树、图算法、排序、复杂数学计算等）时，请在回复中调用工具：
+1. 格式规范：在 <tool_call> 标签内直接编写 JavaScript 代码（建议使用 ```javascript 包裹）。
+2. 语法要求：代码必须为合法的 JavaScript (ES6) 脚本，可使用 console.log() 输出结果，可使用 assert(condition, message) 进行断言验证。
+3. 严禁事项：<tool_call> 内部必须直接放代码，严禁包裹 <function>、<parameter>、<xml> 等额外的 XML 标签。
+4. 执行与反馈：系统会自动执行脚本，并将控制台输出返回在 <tool_response> 中。你必须根据 <tool_response> 的测试结果输出最终正确方案。
+
+【调用示例 (One-Shot Example)】
+用户：请验证 1 + 1 是否等于 2。
+助手：
+让我调用 JavaScript 运行时来验证这个计算：
 <tool_call>
 ```javascript
-// 编写待验证的代码与自动化测试用例
-console.log("测试结果:", ...);
+const result = 1 + 1;
+console.log("计算结果:", result);
+assert(result === 2, "1 + 1 应该等于 2");
 ```
 </tool_call>
-
-系统执行后会自动将控制台输出返回在 <tool_response> 中。
-请根据运行结果检验算法：如果测试通过，请结合验证结果输出最终方案；如果测试未通过，请分析原因并修正。"""
+<tool_response>
+[输出]
+计算结果: 2
+[状态] 执行成功 (无输出)
+</tool_response>
+经过 JavaScript 运行时验证，计算结果 1 + 1 = 2，断言验证通过。"""
     private val CONV_LAYERS = intArrayOf(0, 1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23)
     private val KV_LAYERS = intArrayOf(2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22)
     private const val CONV_CHANNELS = 2048
@@ -339,7 +352,10 @@ console.log("测试结果:", ...);
                         }
 
                         // Detect and execute JavaScript tool call if emitted by model
-                        if (enableTools && toolExecutionCount < maxToolCalls && lastDecodeText.contains("</tool_call>")) {
+                        val hasToolCallEnd = lastDecodeText.contains("</tool_call>") ||
+                                lastDecodeText.contains("</run_javascript>") ||
+                                lastDecodeText.contains("</function>")
+                        if (enableTools && toolExecutionCount < maxToolCalls && hasToolCallEnd) {
                             val toolCall = LfmToolCallParser.findNextToolCall(lastDecodeText, fromIndex = lastExecutedToolEnd)
                             if (toolCall != null && toolCall.code.isNotBlank()) {
                                 toolExecutionCount++
@@ -351,7 +367,7 @@ console.log("测试结果:", ...);
                                 val execResult = OpTrace.time("lfm.tool.exec", "tools") {
                                     JsRuntime.execute(toolCall.code)
                                 }
-                                LfmChatLogger.info("TOOL_CALL_RESULT success=${execResult.success} timeMs=${execResult.executionTimeMs}ms")
+                                LfmChatLogger.info("TOOL_CALL_RESULT success=${execResult.success} timeMs=${execResult.executionTimeMs}ms error=${execResult.error}")
 
                                 val responseText = LfmToolCallParser.formatToolResponse(execResult)
                                 val respIds = tok.encode(responseText)

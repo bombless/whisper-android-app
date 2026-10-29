@@ -56,13 +56,15 @@ sealed interface ChatMessageBlock {
  * Supports partial/streaming markdown safely.
  */
 fun parseMarkdownBlocks(rawText: String): List<ChatMessageBlock> {
-    if (!rawText.contains("<tool_call", ignoreCase = true) && !rawText.contains("<run_javascript", ignoreCase = true)) {
+    if (!rawText.contains("<tool_call", ignoreCase = true) &&
+        !rawText.contains("<run_javascript", ignoreCase = true) &&
+        !rawText.contains("<function", ignoreCase = true)) {
         return parseStandardMarkdownBlocks(rawText)
     }
 
     val blocks = mutableListOf<ChatMessageBlock>()
     val toolCallPattern = Regex(
-        """<tool_call(?::([a-zA-Z0-9_-]+))?>([\s\S]*?)(?:</tool_call(?::\1)?>|$)""",
+        """<(?:tool_call(?::([a-zA-Z0-9_-]+))?|run_javascript|function(?:=([a-zA-Z0-9_-]+))?)>([\s\S]*?)(?:</(?:tool_call(?::\1)?|run_javascript|function)>|$)""",
         RegexOption.IGNORE_CASE
     )
     val toolResponsePattern = Regex(
@@ -82,8 +84,10 @@ fun parseMarkdownBlocks(rawText: String): List<ChatMessageBlock> {
             }
         }
 
-        val toolName = match.groupValues.getOrNull(1)?.takeIf { it.isNotBlank() } ?: "JavaScript 运行时"
-        val rawCode = match.groupValues.getOrNull(2) ?: ""
+        val toolName = match.groupValues.getOrNull(1)?.takeIf { it.isNotBlank() }
+            ?: match.groupValues.getOrNull(2)?.takeIf { it.isNotBlank() }
+            ?: "JavaScript 运行时"
+        val rawCode = match.groupValues.getOrNull(3) ?: ""
         val code = LfmToolCallParser.extractCode(rawCode)
 
         var afterToolCall = rawText.substring(match.range.last + 1)
@@ -96,7 +100,10 @@ fun parseMarkdownBlocks(rawText: String): List<ChatMessageBlock> {
             null
         }
 
-        val isRunning = response == null && !match.value.contains("</tool_call", ignoreCase = true)
+        val isClosed = match.value.contains("</tool_call", ignoreCase = true) ||
+                match.value.contains("</run_javascript", ignoreCase = true) ||
+                match.value.contains("</function", ignoreCase = true)
+        val isRunning = response == null && !isClosed
         blocks.add(
             ChatMessageBlock.ToolExecutionBlock(
                 toolName = toolName,

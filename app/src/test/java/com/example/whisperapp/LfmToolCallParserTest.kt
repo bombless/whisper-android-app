@@ -1,5 +1,6 @@
 package com.example.whisperapp
 
+import com.example.whisperapp.js.JsRuntime
 import com.example.whisperapp.js.LfmToolCallParser
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
@@ -84,5 +85,69 @@ class LfmToolCallParserTest {
 
         val call3 = LfmToolCallParser.findNextToolCall(text, fromIndex = call2!!.endIndex)
         assertNull(call3)
+    }
+
+    @Test
+    fun testToolCallWithFunctionAndParameterTags() {
+        val text = """
+            <tool_call>
+            <function=tool>
+            <parameter=code>
+            console.log("1 + 1 =", 1 + 1);
+            </parameter>
+            </function>
+            </tool_call>
+        """.trimIndent()
+
+        val call = LfmToolCallParser.findNextToolCall(text)
+        assertNotNull(call)
+        assertEquals("console.log(\"1 + 1 =\", 1 + 1);", call?.code)
+
+        val result = JsRuntime.execute(call!!.code)
+        assertTrue("Execution should succeed without ReferenceError: ${result.error}", result.success)
+        assertTrue(result.stdout.contains("1 + 1 = 2"))
+    }
+
+    @Test
+    fun testToolCallWithParameterNameAttributeAndFence() {
+        val text = """
+            <tool_call:run_javascript>
+            <function name="run_javascript">
+            <parameter name="code">
+            ```javascript
+            assert(1 + 1 === 2, "OK");
+            console.log("all good");
+            ```
+            </parameter>
+            </function>
+            </tool_call:run_javascript>
+        """.trimIndent()
+
+        val call = LfmToolCallParser.findNextToolCall(text)
+        assertNotNull(call)
+        assertEquals("assert(1 + 1 === 2, \"OK\");\nconsole.log(\"all good\");", call?.code)
+
+        val result = JsRuntime.execute(call!!.code)
+        assertTrue(result.success)
+        assertTrue(result.stdout.contains("all good"))
+    }
+
+    @Test
+    fun testStandaloneFunctionTag() {
+        val text = """
+            <function=tool>
+            <parameter=code>
+            console.log("hello from standalone");
+            </parameter>
+            </function>
+        """.trimIndent()
+
+        val call = LfmToolCallParser.findNextToolCall(text)
+        assertNotNull(call)
+        assertEquals("console.log(\"hello from standalone\");", call?.code)
+
+        val result = JsRuntime.execute(call!!.code)
+        assertTrue(result.success)
+        assertTrue(result.stdout.contains("hello from standalone"))
     }
 }
