@@ -44,6 +44,69 @@ console.log("测试结果:", ...);
     private const val KV_HEADS = 4
     private const val HEAD_DIM = 128
 
+    private class ConvCachePool {
+        private val buffers = HashMap<Int, FloatArray>()
+        init {
+            for (l in CONV_LAYERS) {
+                buffers[l] = FloatArray(CONV_CHANNELS * CONV_KERNEL)
+            }
+        }
+        fun get(layer: Int): FloatArray = buffers.getValue(layer)
+        fun reset() {
+            for (b in buffers.values) b.fill(0f)
+        }
+    }
+
+    private class KvLayerCache(initialCapacityTokens: Int = 1024) {
+        private var capacity = initialCapacityTokens
+        var array = FloatArray(512 * capacity)
+            private set
+
+        fun reset() {}
+
+        private fun ensureCapacity(tokens: Int) {
+            if (tokens > capacity) {
+                var newCap = capacity * 2
+                while (newCap < tokens) newCap *= 2
+                val newArr = FloatArray(512 * newCap)
+                System.arraycopy(array, 0, newArr, 0, 512 * capacity)
+                array = newArr
+                capacity = newCap
+            }
+        }
+
+        fun wrap(tokens: Int): FloatBuffer {
+            return FloatBuffer.wrap(array, 0, 512 * tokens)
+        }
+
+        fun updateFrom(tensor: OnnxTensor, totalTokens: Int) {
+            ensureCapacity(totalTokens)
+            val fb = tensor.floatBuffer
+            fb.get(array, 0, 512 * totalTokens)
+        }
+    }
+
+    private class KvCachePool {
+        private val keyCaches = HashMap<Int, KvLayerCache>()
+        private val valCaches = HashMap<Int, KvLayerCache>()
+        init {
+            for (l in KV_LAYERS) {
+                keyCaches[l] = KvLayerCache()
+                valCaches[l] = KvLayerCache()
+            }
+        }
+        fun getKey(layer: Int): KvLayerCache = keyCaches.getValue(layer)
+        fun getValue(layer: Int): KvLayerCache = valCaches.getValue(layer)
+        fun reset() {
+            for (c in keyCaches.values) c.reset()
+            for (c in valCaches.values) c.reset()
+        }
+    }
+
+    private val convPool = ConvCachePool()
+    private val kvPool = KvCachePool()
+    private val staticAllOnesMask = LongArray(8192) { 1L }
+
     @Volatile
     private var cancelRequested = false
 
@@ -98,12 +161,17 @@ console.log("测试结果:", ...);
                 stage = "configure_session_options"
                 val options = OrtSession.SessionOptions().apply {
                     setSessionLogLevel(OrtLoggingLevel.ORT_LOGGING_LEVEL_WARNING)
+                    setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
                     addExecutionProvider(listOf(device), mapOf(
                         "backend_path" to backend.absolutePath,
                         "soc_model" to "57",
                         "htp_arch" to "75",
                         "enable_htp_fp16_precision" to "1",
                         "enable_block_quant_weight_optimization" to "1",
+                        "htp_performance_mode" to "burst",
+                        "qnn_context_priority" to "high",
+                        "vtcm_mb" to "8",
+                        "htp_graph_finalization_optimization_mode" to "3",
                     ))
                 }
                 stage = "create_onnx_session"
@@ -145,10 +213,15 @@ console.log("测试结果:", ...);
         val promptIds = tok.encode(promptText).toMutableList()
         require(promptIds.isNotEmpty()) { "Prompt tokenization produced no tokens" }
         val startedNs = System.nanoTime()
+        val runId = OpTrace.beginRun("lfm3_chat", mapOf("prompt_tokens" to promptIds.size.toString()))
+
         LfmChatLogger.info("GENERATE_START historyLen=${history.size} promptChars=${promptText.length} promptTokens=${promptIds.size} maxTokens=$maxTokens eosId=${LfmTokenizer.EOS_ID}")
         LfmChatLogger.info("PROMPT_PREVIEW ${promptText.take(200).replace("\n", "\\n")}")
 
-        val past = HashMap<String, FloatArray>()
+        convPool.reset()
+        kvPool.reset()
+
+        val streamDecoder = tok.createStreamDecoder()
         var pastLen = 0
         var inputIds = promptIds
         val generatedIds = ArrayList<Int>()
@@ -157,159 +230,244 @@ console.log("测试结果:", ...);
         var lastExecutedToolEnd = 0
         var toolExecutionCount = 0
         val maxToolCalls = 3
+        val stepLatencies = ArrayList<Double>()
         onToken?.invoke(lastDecodeText)
 
-        for (step in 0 until maxTokens) {
-            if (cancelRequested || isCancelled?.invoke() == true || Thread.currentThread().isInterrupted) {
-                stopReason = "USER_CANCELLED"
-                LfmChatLogger.info("GENERATE_CANCELLED at step=$step generated=${generatedIds.size}")
-                break
-            }
-            val sequenceLength = inputIds.size
-            val inputs = LinkedHashMap<String, OnnxTensor>()
-            val owned = ArrayList<OnnxTensor>()
-            try {
-                inputs["input_ids"] = longTensor(inputIds.map { it.toLong() }.toLongArray(), longArrayOf(1, sequenceLength.toLong()), owned)
-                inputs["attention_mask"] = longTensor(LongArray(pastLen + sequenceLength) { 1L }, longArrayOf(1, (pastLen + sequenceLength).toLong()), owned)
-                inputs["position_ids"] = longTensor(LongArray(sequenceLength) { (pastLen + it).toLong() }, longArrayOf(1, sequenceLength.toLong()), owned)
-                inputs["logits_to_keep"] = longTensor(longArrayOf(1L), longArrayOf(1), owned)
+        val runOptions = OrtSession.RunOptions().apply {
+            addRunConfigEntry("qnn.htp_perf_mode", "burst")
+            addRunConfigEntry("qnn.perf_mode", "burst")
+        }
 
-                // Conv state cache (13 layers)
-                for (layer in CONV_LAYERS) {
-                    inputs["past_conv.$layer"] = floatTensor(
-                        past["past_conv.$layer"] ?: FloatArray(CONV_CHANNELS * CONV_KERNEL),
-                        longArrayOf(1, CONV_CHANNELS.toLong(), CONV_KERNEL.toLong()), owned
-                    )
+        try {
+            for (step in 0 until maxTokens) {
+                if (cancelRequested || isCancelled?.invoke() == true || Thread.currentThread().isInterrupted) {
+                    stopReason = "USER_CANCELLED"
+                    LfmChatLogger.info("GENERATE_CANCELLED at step=$step generated=${generatedIds.size}")
+                    break
                 }
-                // KV attention cache (11 layers)
-                for (layer in KV_LAYERS) {
-                    val k = "past_key_values.$layer.key"
-                    val v = "past_key_values.$layer.value"
-                    inputs[k] = floatTensor(
-                        past[k] ?: FloatArray(KV_HEADS * pastLen * HEAD_DIM),
-                        longArrayOf(1, KV_HEADS.toLong(), pastLen.toLong(), HEAD_DIM.toLong()), owned
-                    )
-                    inputs[v] = floatTensor(
-                        past[v] ?: FloatArray(KV_HEADS * pastLen * HEAD_DIM),
-                        longArrayOf(1, KV_HEADS.toLong(), pastLen.toLong(), HEAD_DIM.toLong()), owned
-                    )
-                }
+                val stepT0 = System.nanoTime()
+                val sequenceLength = inputIds.size
+                val inputs = LinkedHashMap<String, OnnxTensor>()
+                val owned = ArrayList<OnnxTensor>()
+                try {
+                    val totalMaskLen = pastLen + sequenceLength
+                    val maskBuffer = if (totalMaskLen <= staticAllOnesMask.size) {
+                        LongBuffer.wrap(staticAllOnesMask, 0, totalMaskLen)
+                    } else {
+                        LongBuffer.wrap(LongArray(totalMaskLen) { 1L })
+                    }
+                    val posArray = if (sequenceLength == 1) {
+                        longArrayOf(pastLen.toLong())
+                    } else {
+                        LongArray(sequenceLength) { (pastLen + it).toLong() }
+                    }
 
-                val stepStartedNs = System.nanoTime()
-                s.run(inputs).use { result ->
-                    val outputs = s.outputNames.associateWith { name -> result[s.outputNames.indexOf(name)] as OnnxTensor }
-                    val logits = outputs.getValue("logits")
-                    var nextToken = argmaxLastPosition(logits)
-                    val stepMs = (System.nanoTime() - stepStartedNs) / 1_000_000
-                    generatedIds += nextToken
+                    inputs["input_ids"] = longTensor(inputIds.map { it.toLong() }.toLongArray(), longArrayOf(1, sequenceLength.toLong()), owned)
+                    inputs["attention_mask"] = longTensor(maskBuffer, longArrayOf(1, totalMaskLen.toLong()), owned)
+                    inputs["position_ids"] = longTensor(posArray, longArrayOf(1, sequenceLength.toLong()), owned)
+                    inputs["logits_to_keep"] = longTensor(longArrayOf(1L), longArrayOf(1), owned)
 
-                    // Update past cache from output tensors
+                    // Conv state cache (13 layers) - zero heap allocation via preallocated buffers
                     for (layer in CONV_LAYERS) {
-                        past["past_conv.$layer"] = readFloats(outputs.getValue("present_conv.$layer"))
+                        inputs["past_conv.$layer"] = floatTensor(
+                            convPool.get(layer),
+                            longArrayOf(1, CONV_CHANNELS.toLong(), CONV_KERNEL.toLong()), owned
+                        )
                     }
+                    // KV attention cache (11 layers) - zero heap allocation via capacity pooling
                     for (layer in KV_LAYERS) {
-                        past["past_key_values.$layer.key"] = readFloats(outputs.getValue("present.$layer.key"))
-                        past["past_key_values.$layer.value"] = readFloats(outputs.getValue("present.$layer.value"))
+                        val k = "past_key_values.$layer.key"
+                        val v = "past_key_values.$layer.value"
+                        inputs[k] = floatTensor(
+                            kvPool.getKey(layer).wrap(pastLen),
+                            longArrayOf(1, KV_HEADS.toLong(), pastLen.toLong(), HEAD_DIM.toLong()), owned
+                        )
+                        inputs[v] = floatTensor(
+                            kvPool.getValue(layer).wrap(pastLen),
+                            longArrayOf(1, KV_HEADS.toLong(), pastLen.toLong(), HEAD_DIM.toLong()), owned
+                        )
                     }
 
-                    if (step == 0 || step % 32 == 0 || nextToken == LfmTokenizer.EOS_ID) {
-                        val currentToks = generatedIds.size
-                        val totalElapsedMs = (System.nanoTime() - startedNs) / 1_000_000
-                        val speed = if (totalElapsedMs > 0) String.format("%.1f", currentToks * 1000.0 / totalElapsedMs) else "0.0"
-                        LfmChatLogger.info("STEP step=$step token=$nextToken pastLen=$pastLen seqLen=$sequenceLength stepMs=${stepMs}ms generated=${currentToks} speed=${speed}tok/s")
-                    }
+                    val prepNs = System.nanoTime()
+                    s.run(inputs, runOptions).use { result ->
+                        val runNs = System.nanoTime()
+                        val outputs = s.outputNames.associateWith { name -> result[s.outputNames.indexOf(name)] as OnnxTensor }
+                        val logits = outputs.getValue("logits")
+                        var nextToken = argmaxLastPosition(logits)
+                        generatedIds += nextToken
 
-                    // Decode streaming text for UI
-                    val decoded = tok.decode(generatedIds.toIntArray())
-                    lastDecodeText = if (decoded.startsWith("<think>")) decoded else (THINKING_PROMPT_PREFIX + decoded)
-                    onToken?.invoke(lastDecodeText)
+                        // Update past cache from output tensors directly into pooled arrays
+                        val newTotalLen = pastLen + sequenceLength
+                        for (layer in CONV_LAYERS) {
+                            outputs.getValue("present_conv.$layer").floatBuffer.get(convPool.get(layer))
+                        }
+                        for (layer in KV_LAYERS) {
+                            kvPool.getKey(layer).updateFrom(outputs.getValue("present.$layer.key"), newTotalLen)
+                            kvPool.getValue(layer).updateFrom(outputs.getValue("present.$layer.value"), newTotalLen)
+                        }
+                        val extractNs = System.nanoTime()
 
-                    // Detect and execute JavaScript tool call if emitted by model
-                    if (enableTools && toolExecutionCount < maxToolCalls) {
-                        val toolCall = LfmToolCallParser.findNextToolCall(lastDecodeText, fromIndex = lastExecutedToolEnd)
-                        if (toolCall != null && toolCall.code.isNotBlank()) {
-                            toolExecutionCount++
-                            lastExecutedToolEnd = toolCall.endIndex
-                            LfmChatLogger.info("TOOL_CALL_DETECTED tool=${toolCall.name} codeChars=${toolCall.code.length} iteration=$toolExecutionCount")
+                        // Incremental streaming text decode
+                        val streamText = streamDecoder.append(nextToken)
+                        lastDecodeText = if (streamText.startsWith("<think>")) streamText else (THINKING_PROMPT_PREFIX + streamText)
+                        onToken?.invoke(lastDecodeText)
+                        val decodeNs = System.nanoTime()
 
-                            // Inform UI that the JS tool is actively running
-                            onToken?.invoke(lastDecodeText + "\n[⚙️ JavaScript 运行时正在执行并测试代码...]\n")
+                        val prepMs = (prepNs - stepT0) / 1_000_000.0
+                        val runMs = (runNs - prepNs) / 1_000_000.0
+                        val extractMs = (extractNs - runNs) / 1_000_000.0
+                        val decMs = (decodeNs - extractNs) / 1_000_000.0
+                        val totalStepMs = (decodeNs - stepT0) / 1_000_000.0
+                        stepLatencies.add(totalStepMs)
 
-                            val execResult = JsRuntime.execute(toolCall.code)
-                            LfmChatLogger.info("TOOL_CALL_RESULT success=${execResult.success} timeMs=${execResult.executionTimeMs}ms")
+                        OpTrace.record("lfm.step.prep", "host", prepMs)
+                        OpTrace.record("lfm.step.run", "device", runMs, mapOf("step" to step.toString(), "seqLen" to sequenceLength.toString(), "pastLen" to pastLen.toString()))
+                        OpTrace.record("lfm.step.extract", "host", extractMs)
+                        OpTrace.record("lfm.step.decode", "postprocess", decMs)
+                        OpTrace.record("lfm.step.total", "pipeline", totalStepMs)
 
-                            val responseText = LfmToolCallParser.formatToolResponse(execResult)
-                            val respIds = tok.encode(responseText)
-                            if (respIds.isNotEmpty()) {
-                                generatedIds += respIds.toList()
+                        if (step == 0 || step % 16 == 0 || nextToken == LfmTokenizer.EOS_ID) {
+                            val currentToks = generatedIds.size
+                            val totalElapsedMs = (System.nanoTime() - startedNs) / 1_000_000
+                            val speed = if (totalElapsedMs > 0) String.format("%.1f", currentToks * 1000.0 / totalElapsedMs) else "0.0"
+                            val heapMb = (Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory()) / (1024 * 1024)
+                            LfmChatLogger.info(
+                                "STEP step=%4d tok=%6d seqLen=%3d pastLen=%4d | prep=%4.1fms run=%4.1fms ext=%4.1fms dec=%4.1fms total=%5.1fms | speed=%4s tok/s heap=%3dMB".format(
+                                    step, nextToken, sequenceLength, pastLen, prepMs, runMs, extractMs, decMs, totalStepMs, speed, heapMb
+                                )
+                            )
+                        }
 
-                                // Ingest tool response tokens into model KV cache
-                                for (respTok in respIds) {
+                        // Detect and execute JavaScript tool call if emitted by model
+                        if (enableTools && toolExecutionCount < maxToolCalls && lastDecodeText.contains("</tool_call>")) {
+                            val toolCall = LfmToolCallParser.findNextToolCall(lastDecodeText, fromIndex = lastExecutedToolEnd)
+                            if (toolCall != null && toolCall.code.isNotBlank()) {
+                                toolExecutionCount++
+                                lastExecutedToolEnd = toolCall.endIndex
+                                LfmChatLogger.info("TOOL_CALL_DETECTED tool=${toolCall.name} codeChars=${toolCall.code.length} iteration=$toolExecutionCount")
+
+                                onToken?.invoke(lastDecodeText + "\n[⚙️ JavaScript 运行时正在执行并测试代码...]\n")
+
+                                val execResult = OpTrace.time("lfm.tool.exec", "tools") {
+                                    JsRuntime.execute(toolCall.code)
+                                }
+                                LfmChatLogger.info("TOOL_CALL_RESULT success=${execResult.success} timeMs=${execResult.executionTimeMs}ms")
+
+                                val responseText = LfmToolCallParser.formatToolResponse(execResult)
+                                val respIds = tok.encode(responseText)
+                                if (respIds.isNotEmpty()) {
+                                    generatedIds += respIds.toList()
+
+                                    // Batch Prefill: Ingest all tool response tokens into model KV cache in a single forward pass
+                                    val respLen = respIds.size
+                                    val currentPast = pastLen + sequenceLength
                                     val feedInputs = LinkedHashMap<String, OnnxTensor>()
                                     val feedOwned = ArrayList<OnnxTensor>()
                                     try {
-                                        feedInputs["input_ids"] = longTensor(longArrayOf(respTok.toLong()), longArrayOf(1, 1), feedOwned)
-                                        feedInputs["attention_mask"] = longTensor(LongArray(pastLen + 1) { 1L }, longArrayOf(1, (pastLen + 1).toLong()), feedOwned)
-                                        feedInputs["position_ids"] = longTensor(longArrayOf(pastLen.toLong()), longArrayOf(1, 1), feedOwned)
+                                        val feedMaskLen = currentPast + respLen
+                                        val feedMaskBuffer = if (feedMaskLen <= staticAllOnesMask.size) {
+                                            LongBuffer.wrap(staticAllOnesMask, 0, feedMaskLen)
+                                        } else {
+                                            LongBuffer.wrap(LongArray(feedMaskLen) { 1L })
+                                        }
+                                        feedInputs["input_ids"] = longTensor(respIds.map { it.toLong() }.toLongArray(), longArrayOf(1, respLen.toLong()), feedOwned)
+                                        feedInputs["attention_mask"] = longTensor(feedMaskBuffer, longArrayOf(1, feedMaskLen.toLong()), feedOwned)
+                                        feedInputs["position_ids"] = longTensor(LongArray(respLen) { (currentPast + it).toLong() }, longArrayOf(1, respLen.toLong()), feedOwned)
                                         feedInputs["logits_to_keep"] = longTensor(longArrayOf(1L), longArrayOf(1), feedOwned)
 
                                         for (l in CONV_LAYERS) {
                                             feedInputs["past_conv.$l"] = floatTensor(
-                                                past["past_conv.$l"] ?: FloatArray(CONV_CHANNELS * CONV_KERNEL),
+                                                convPool.get(l),
                                                 longArrayOf(1, CONV_CHANNELS.toLong(), CONV_KERNEL.toLong()), feedOwned
                                             )
                                         }
                                         for (l in KV_LAYERS) {
                                             feedInputs["past_key_values.$l.key"] = floatTensor(
-                                                past["past_key_values.$l.key"] ?: FloatArray(KV_HEADS * pastLen * HEAD_DIM),
-                                                longArrayOf(1, KV_HEADS.toLong(), pastLen.toLong(), HEAD_DIM.toLong()), feedOwned
+                                                kvPool.getKey(l).wrap(currentPast),
+                                                longArrayOf(1, KV_HEADS.toLong(), currentPast.toLong(), HEAD_DIM.toLong()), feedOwned
                                             )
                                             feedInputs["past_key_values.$l.value"] = floatTensor(
-                                                past["past_key_values.$l.value"] ?: FloatArray(KV_HEADS * pastLen * HEAD_DIM),
-                                                longArrayOf(1, KV_HEADS.toLong(), pastLen.toLong(), HEAD_DIM.toLong()), feedOwned
+                                                kvPool.getValue(l).wrap(currentPast),
+                                                longArrayOf(1, KV_HEADS.toLong(), currentPast.toLong(), HEAD_DIM.toLong()), feedOwned
                                             )
                                         }
 
-                                        s.run(feedInputs).use { feedRes ->
+                                        val toolPrefillStartNs = System.nanoTime()
+                                        s.run(feedInputs, runOptions).use { feedRes ->
                                             val outMap = s.outputNames.associateWith { name -> feedRes[s.outputNames.indexOf(name)] as OnnxTensor }
+                                            val updatedPastLen = currentPast + respLen
                                             for (l in CONV_LAYERS) {
-                                                past["past_conv.$l"] = readFloats(outMap.getValue("present_conv.$l"))
+                                                outMap.getValue("present_conv.$l").floatBuffer.get(convPool.get(l))
                                             }
                                             for (l in KV_LAYERS) {
-                                                past["past_key_values.$l.key"] = readFloats(outMap.getValue("present.$l.key"))
-                                                past["past_key_values.$l.value"] = readFloats(outMap.getValue("present.$l.value"))
+                                                kvPool.getKey(l).updateFrom(outMap.getValue("present.$l.key"), updatedPastLen)
+                                                kvPool.getValue(l).updateFrom(outMap.getValue("present.$l.value"), updatedPastLen)
                                             }
                                             nextToken = argmaxLastPosition(outMap.getValue("logits"))
                                         }
-                                        pastLen += 1
+                                        val toolPrefillMs = (System.nanoTime() - toolPrefillStartNs) / 1_000_000.0
+                                        LfmChatLogger.info("TOOL_BATCH_PREFILL tokens=$respLen timeMs=${String.format("%.1f", toolPrefillMs)}ms speed=${String.format("%.1f", respLen * 1000.0 / toolPrefillMs.coerceAtLeast(1.0))}tok/s")
+                                        OpTrace.record("lfm.tool.batch_prefill", "pipeline", toolPrefillMs, mapOf("tokens" to respLen.toString()))
+                                        pastLen += respLen
                                     } finally {
                                         feedOwned.forEach { runCatching { it.close() } }
                                     }
-                                }
 
-                                val fullDecoded = tok.decode(generatedIds.toIntArray())
-                                lastDecodeText = if (fullDecoded.startsWith("<think>")) fullDecoded else (THINKING_PROMPT_PREFIX + fullDecoded)
-                                lastExecutedToolEnd = lastDecodeText.length
-                                onToken?.invoke(lastDecodeText)
+                                    streamDecoder.appendAll(respIds.toList())
+                                    val fullDecoded = streamDecoder.text()
+                                    lastDecodeText = if (fullDecoded.startsWith("<think>")) fullDecoded else (THINKING_PROMPT_PREFIX + fullDecoded)
+                                    lastExecutedToolEnd = lastDecodeText.length
+                                    onToken?.invoke(lastDecodeText)
+                                }
                             }
                         }
                     }
+                } finally {
+                    owned.forEach { runCatching { it.close() } }
                 }
-            } finally {
-                owned.forEach { runCatching { it.close() } }
-            }
 
-            pastLen += sequenceLength
-            if (generatedIds.last() == LfmTokenizer.EOS_ID) {
-                stopReason = "EOS_TOKEN"
-                break
+                pastLen += sequenceLength
+                if (generatedIds.last() == LfmTokenizer.EOS_ID) {
+                    stopReason = "EOS_TOKEN"
+                    break
+                }
+                inputIds = mutableListOf(generatedIds.last())
             }
-            inputIds = mutableListOf(generatedIds.last())
+        } finally {
+            runOptions.close()
         }
 
         val totalElapsedMs = (System.nanoTime() - startedNs) / 1_000_000
-        val avgSpeed = if (totalElapsedMs > 0) String.format("%.1f", generatedIds.size * 1000.0 / totalElapsedMs) else "0.0"
-        LfmChatLogger.info("GENERATE_FINISH totalTokens=${generatedIds.size} elapsedMs=${totalElapsedMs}ms avgSpeed=${avgSpeed}tok/s stopReason=$stopReason logFile=${LfmChatLogger.getLogPath()}")
+        val sortedLatencies = stepLatencies.sorted()
+        val minStepMs = sortedLatencies.firstOrNull() ?: 0.0
+        val maxStepMs = sortedLatencies.lastOrNull() ?: 0.0
+        val p50StepMs = if (sortedLatencies.isNotEmpty()) sortedLatencies[sortedLatencies.size / 2] else 0.0
+        val p90StepMs = if (sortedLatencies.isNotEmpty()) sortedLatencies[(sortedLatencies.size * 0.9).toInt().coerceAtMost(sortedLatencies.size - 1)] else 0.0
+        val p99StepMs = if (sortedLatencies.isNotEmpty()) sortedLatencies[(sortedLatencies.size * 0.99).toInt().coerceAtMost(sortedLatencies.size - 1)] else 0.0
+
+        val promptTokensCount = promptIds.size
+        val generatedTokensCount = generatedIds.size
+        val prefillMs = stepLatencies.firstOrNull() ?: 0.0
+        val decodeElapsedMs = (totalElapsedMs - prefillMs).coerceAtLeast(0.0)
+        val decodeTokens = (generatedTokensCount - 1).coerceAtLeast(0)
+        val prefillSpeed = if (prefillMs > 0) String.format("%.1f", promptTokensCount * 1000.0 / prefillMs) else "0.0"
+        val decodeSpeed = if (decodeElapsedMs > 0) String.format("%.1f", decodeTokens * 1000.0 / decodeElapsedMs) else "0.0"
+        val avgSpeed = if (totalElapsedMs > 0) String.format("%.1f", generatedTokensCount * 1000.0 / totalElapsedMs) else "0.0"
+
+        LfmChatLogger.info(
+            "GENERATE_SUMMARY totalTokens=$generatedTokensCount promptTokens=$promptTokensCount elapsedMs=${totalElapsedMs}ms " +
+            "ttftMs=${String.format("%.1f", prefillMs)} prefillSpeed=${prefillSpeed}tok/s " +
+            "decodeSpeed=${decodeSpeed}tok/s avgSpeed=${avgSpeed}tok/s " +
+            "latency=[min=%.1f, p50=%.1f, p90=%.1f, p99=%.1f, max=%.1f]ms toolCalls=$toolExecutionCount stopReason=$stopReason".format(
+                minStepMs, p50StepMs, p90StepMs, p99StepMs, maxStepMs
+            )
+        )
+        OpTrace.endRun(runId, 0.0, mapOf(
+            "total_tokens" to generatedTokensCount.toString(),
+            "elapsed_ms" to totalElapsedMs.toString(),
+            "avg_speed" to avgSpeed,
+            "stop_reason" to stopReason
+        ))
         return lastDecodeText
     }
 
@@ -359,15 +517,14 @@ console.log("测试结果:", ...);
         return bestIndex
     }
 
-    private fun readFloats(tensor: OnnxTensor): FloatArray {
-        val b = tensor.floatBuffer.duplicate()
-        val out = FloatArray(b.remaining())
-        b.get(out)
-        return out
-    }
-
     private fun longTensor(data: LongArray, shape: LongArray, owned: MutableList<OnnxTensor>) =
         OnnxTensor.createTensor(env!!, LongBuffer.wrap(data), shape).also { owned += it }
+
+    private fun longTensor(buffer: LongBuffer, shape: LongArray, owned: MutableList<OnnxTensor>) =
+        OnnxTensor.createTensor(env!!, buffer, shape).also { owned += it }
+
+    private fun floatTensor(buffer: FloatBuffer, shape: LongArray, owned: MutableList<OnnxTensor>) =
+        OnnxTensor.createTensor(env!!, buffer, shape).also { owned += it }
 
     private fun floatTensor(data: FloatArray, shape: LongArray, owned: MutableList<OnnxTensor>) =
         OnnxTensor.createTensor(env!!, FloatBuffer.wrap(data), shape).also { owned += it }

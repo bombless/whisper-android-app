@@ -92,6 +92,56 @@ class LfmTokenizer private constructor(
             .trim()
     }
 
+    /**
+     * Extracts the raw byte sequence for a single token id.
+     * Returns null for special/boundary tokens or unknown ids.
+     */
+    fun tokenBytes(id: Int): ByteArray? {
+        if (id == EOS_ID || id == BOS_ID || id < 0) return null
+        val token = inverseVocab[id] ?: return null
+        if (token == "<|im_end|>" || token == "<|im_start|>" || token == "<|startoftext|>") return null
+        val b = ByteArray(token.length)
+        var count = 0
+        for (ch in token) {
+            val byteVal = byteDecoder[ch] ?: continue
+            b[count++] = byteVal.toByte()
+        }
+        return if (count == token.length) b else b.copyOf(count)
+    }
+
+    /**
+     * Efficient stateful streaming decoder that avoids O(N^2) full-sequence re-decoding.
+     */
+    inner class StreamDecoder {
+        private val rawBytes = ArrayList<Byte>(1024)
+
+        fun append(id: Int): String {
+            val bytes = tokenBytes(id)
+            if (bytes != null) {
+                for (b in bytes) rawBytes.add(b)
+            }
+            return text()
+        }
+
+        fun appendAll(ids: List<Int>): String {
+            for (id in ids) {
+                val bytes = tokenBytes(id)
+                if (bytes != null) {
+                    for (b in bytes) rawBytes.add(b)
+                }
+            }
+            return text()
+        }
+
+        fun text(): String {
+            val arr = ByteArray(rawBytes.size)
+            for (i in 0 until rawBytes.size) arr[i] = rawBytes[i]
+            return arr.toString(Charsets.UTF_8)
+        }
+    }
+
+    fun createStreamDecoder(): StreamDecoder = StreamDecoder()
+
     fun specialId(token: String): Int = special[token] ?: vocab[token] ?: error("Missing special token $token")
 
     private val inverseVocab: Map<Int, String> by lazy {
