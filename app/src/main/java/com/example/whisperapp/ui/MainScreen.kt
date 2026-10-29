@@ -5,6 +5,9 @@ import android.content.pm.PackageManager
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.graphics.Bitmap
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -24,12 +27,14 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import com.example.whisperapp.audio.AudioPlayer
 import com.example.whisperapp.audio.LiveTranscriber
 import com.example.whisperapp.audio.WhisperFeatureExtractor
 import com.example.whisperapp.asr.WhisperVariant
 import com.example.whisperapp.qnn.QnnWhisperRealAudioRunner
+import com.example.whisperapp.qnn.SdxlEngine
 import com.example.whisperapp.tts.ChineseTextProcessor
 import com.example.whisperapp.tts.SherpaOnnxTtsEngine
 import com.example.whisperapp.tts.TtsQueue
@@ -39,6 +44,9 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import androidx.compose.runtime.LaunchedEffect
@@ -53,6 +61,11 @@ fun MainScreen() {
         return
     }
     var selectedTab by remember { mutableIntStateOf(0) }
+    var imageBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var imageStatus by remember { mutableStateOf("输入提示词后开始生成。首次加载模型可能需要一些时间。") }
+    var imageBusy by remember { mutableStateOf(false) }
+    var imageJob by remember { mutableStateOf<Job?>(null) }
+    val mainHandler = remember { Handler(Looper.getMainLooper()) }
     var ttsText by remember { mutableStateOf("") }
     var ttsStatus by remember { mutableStateOf("TTS 就绪") }
     var selectedTtsVariant by remember { mutableStateOf(SherpaOnnxTtsEngine.Variant.PIPER_XIAO_YA_INT8) }
@@ -82,7 +95,7 @@ fun MainScreen() {
     var switchJob by remember { mutableStateOf<Job?>(null) }
 
     fun switchToTab(target: Int) {
-        if (target == selectedTab || nativeSwitching) return
+        if (target == selectedTab || nativeSwitching || imageBusy) return
         switchJob?.cancel()
         switchJob = scope.launch(Dispatchers.IO) {
             nativeSwitching = true
@@ -92,8 +105,8 @@ fun MainScreen() {
                     recordingJob?.cancelAndJoin()
                     recordingJob = null
                     processing = false
-                    QnnWhisperRealAudioRunner.stop()
                 }
+                if (selectedTab == 1) QnnWhisperRealAudioRunner.stop()
                 ttsQueue?.clearAndStop()
                 ttsQueue?.closeAndWait()
                 ttsQueue = null
@@ -114,8 +127,10 @@ fun MainScreen() {
                     ttsReady = true
                     ttsStatus = "TTS 已就绪: ${selectedTtsVariant.displayName}"
                     Log.i("WHISPER_TTS", "TAB_NATIVE_READY target=TTS variant=$selectedTtsVariant")
-                } else {
+                } else if (target == 2) {
                     Log.i("WHISPER_CHAT", "TAB_READY target=CHAT")
+                } else {
+                    Log.i("SDXL_UI", "TAB_READY target=IMAGE")
                 }
             } catch (t: Throwable) {
                 Log.e("WHISPER_NATIVE", "TAB_NATIVE_LOAD_FAILED target=$target", t)
@@ -125,6 +140,33 @@ fun MainScreen() {
                 }
             } finally {
                 nativeSwitching = false
+            }
+        }
+    }
+
+    fun generateImage(prompt: String, negativePrompt: String) {
+        if (imageBusy) return
+        imageBusy = true
+        imageStatus = "正在准备模型…"
+        imageJob = scope.launch {
+            val job = currentCoroutineContext()[Job] ?: error("Missing generation job")
+            try {
+                val generated = withContext(Dispatchers.IO) {
+                    SdxlEngine.generate(context, prompt, negativePrompt, 20, System.currentTimeMillis()) { message ->
+                        job.ensureActive()
+                        mainHandler.post { if (job.isActive) imageStatus = message }
+                    }
+                }
+                imageBitmap = generated
+                imageStatus = "生成完成（1024 × 1024）"
+            } catch (_: CancellationException) {
+                imageStatus = "已取消生成"
+            } catch (failure: Throwable) {
+                Log.e("SDXL_UI", "Image generation failed", failure)
+                imageStatus = "生成失败: ${failure.message ?: failure.javaClass.simpleName}"
+            } finally {
+                imageBusy = false
+                imageJob = null
             }
         }
     }
@@ -314,9 +356,10 @@ fun MainScreen() {
                 .padding(horizontal = 20.dp)
         ) {
             TabRow(selectedTabIndex = selectedTab, modifier = Modifier.padding(0.dp)) {
-                Tab(selected = selectedTab == 0, onClick = { switchToTab(0) }, text = { Text("文生语音") })
-                Tab(selected = selectedTab == 1, onClick = { switchToTab(1) }, text = { Text("语音生文") })
-                Tab(selected = selectedTab == 2, onClick = { switchToTab(2) }, text = { Text("聊天") })
+                Tab(selected = selectedTab == 0, enabled = !imageBusy, onClick = { switchToTab(0) }, text = { Text("文生语音", fontSize = 12.sp, maxLines = 1, softWrap = false) })
+                Tab(selected = selectedTab == 1, enabled = !imageBusy, onClick = { switchToTab(1) }, text = { Text("语音生文", fontSize = 12.sp, maxLines = 1, softWrap = false) })
+                Tab(selected = selectedTab == 2, enabled = !imageBusy, onClick = { switchToTab(2) }, text = { Text("聊天", fontSize = 12.sp, maxLines = 1, softWrap = false) })
+                Tab(selected = selectedTab == 3, enabled = !imageBusy, onClick = { switchToTab(3) }, text = { Text("文生图", fontSize = 12.sp, maxLines = 1, softWrap = false) })
             }
             Spacer(Modifier.height(20.dp))
             // The scroll lives inside the TTS/STT panes only: scrolling the whole box gave the
@@ -407,12 +450,14 @@ fun MainScreen() {
                         Text("${sttVariant.displayName} · 16 kHz", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelMedium)
                     }
                 }
-            } else {
+            } else if (selectedTab == 2) {
                 ChatScreen(Modifier.fillMaxSize())
+            } else {
+                ImageGenScreen(imageBitmap, imageStatus, imageBusy, ::generateImage) { imageJob?.cancel() }
             }
             }
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Start) {
-                TextButton(onClick = { showConfig = true }) { Text("⚙ 配置") }
+                TextButton(enabled = !imageBusy, onClick = { showConfig = true }) { Text("⚙ 配置") }
             }
         }
     }

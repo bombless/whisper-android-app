@@ -23,6 +23,17 @@ LFM3-1.7B-ONNX/
 
 # Working directory for downloading/repairing the Turbo asset archive.
 tools/whisper_large_v3_turbo_asset/
+tools/sdxl_qnn/sdxl_base_qnn2.28_8gen3.zip
+tools/sdxl_qnn/output/
+tools/sdxl_qnn/runtime/
+tools/sdxl_qnn/local-dream-reference/
+tools/sdxl_qnn/clip-probe/
+tools/sdxl_qnn/downloads/
+tools/sdxl_qnn/__pycache__/
+tools/sdxl_qnn/baseline-request.json
+tools/sdxl_qnn/baseline-response.txt
+tools/sdxl_qnn/baseline-result.png
+tools/sdxl_qnn/app-result.png
 chat-build/
 
 # Host binaries built from tools/mel_host/host_main.cpp (keep the source, not the output).

@@ -1,8 +1,11 @@
 package com.example.whisperapp.qnn
 
 import android.app.Activity
+import android.content.pm.ApplicationInfo
 import android.os.Bundle
 import android.graphics.Color
+import android.graphics.Bitmap
+import android.util.Log
 import android.view.Gravity
 import android.widget.ScrollView
 import android.widget.TextView
@@ -14,6 +17,59 @@ class QnnSmokeActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val sdxlDiagnostic = listOf("sdxl_prepare", "sdxl_text_smoke", "sdxl_smoke", "sdxl_generate_smoke")
+            .any { intent.getBooleanExtra(it, false) }
+        if (sdxlDiagnostic && (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) == 0) {
+            finish()
+            return
+        }
+        if (intent.getBooleanExtra("sdxl_generate_smoke", false)) {
+            Thread {
+                val reportFile = File(filesDir, "sdxl-generate-result.txt")
+                reportFile.writeText("RUNNING\n")
+                val report = try {
+                    val started = System.nanoTime()
+                    val image = SdxlEngine.generate(this, "a red apple on a wooden table, natural light, photograph", "blurry, distorted", 20, 12345L) {
+                        Log.i("SDXL_GENERATE", it)
+                    }
+                    val output = File(filesDir, "sdxl-generate-result.png")
+                    output.outputStream().use { check(image.compress(Bitmap.CompressFormat.PNG, 100, it)) }
+                    "PASS: ${image.width}x${image.height}, ${(System.nanoTime() - started) / 1_000_000}ms, ${output.absolutePath}"
+                } catch (failure: Throwable) {
+                    Log.e("SDXL_GENERATE", "Failed", failure)
+                    "FAIL: ${failure.javaClass.name}: ${failure.message}"
+                }
+                reportFile.writeText(report)
+                runOnUiThread { finish() }
+            }.start()
+            return
+        }
+        if (intent.getBooleanExtra("sdxl_prepare", false)) {
+            val report = runCatching { QnnSdxlSmokeRunner.prepare(this) }
+                .fold({ "READY: $it" }, { "FAIL: ${it.javaClass.name}: ${it.message}" })
+            File(filesDir, "sdxl-prepare-result.txt").writeText(report)
+            finish()
+            return
+        }
+        if (intent.getBooleanExtra("sdxl_text_smoke", false)) {
+            Thread {
+                val reportFile = File(filesDir, "sdxl-text-smoke-result.txt")
+                reportFile.writeText("RUNNING\n")
+                reportFile.writeText(QnnSdxlSmokeRunner.runText(this))
+                runOnUiThread { finish() }
+            }.start()
+            return
+        }
+        if (intent.getBooleanExtra("sdxl_smoke", false)) {
+            Thread {
+                val reportFile = File(filesDir, "sdxl-qnn-smoke-result.txt")
+                reportFile.writeText("RUNNING\n")
+                val report = QnnSdxlSmokeRunner.run(this)
+                reportFile.writeText(report)
+                runOnUiThread { finish() }
+            }.start()
+            return
+        }
         if (intent.getBooleanExtra("encoder_smoke", false)) {
             Thread {
                 val result = QnnEncoderSmokeRunner.run(this)
