@@ -1,5 +1,6 @@
 package com.example.whisperapp.ui
 
+import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
@@ -15,6 +16,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -211,6 +213,7 @@ fun FormattedCodeBlock(
 ) {
     val clipboardManager = LocalClipboardManager.current
     var copied by remember { mutableStateOf(false) }
+    val scrollState = rememberScrollState()
 
     LaunchedEffect(copied) {
         if (copied) {
@@ -262,15 +265,32 @@ fun FormattedCodeBlock(
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .horizontalScroll(rememberScrollState())
-                    .padding(12.dp)
+                    .horizontalScroll(scrollState)
             ) {
                 Text(
                     text = code,
+                    modifier = Modifier.padding(12.dp),
                     fontFamily = FontFamily.Monospace,
                     fontSize = 12.5.sp,
                     lineHeight = 18.sp,
-                    color = Color(0xFFF2F2F2)
+                    color = Color(0xFFF2F2F2),
+                    softWrap = false
+                )
+            }
+
+            // Subtle scrollbar track when code exceeds viewport width
+            if (scrollState.maxValue > 0) {
+                LinearProgressIndicator(
+                    progress = {
+                        if (scrollState.maxValue > 0) {
+                            (scrollState.value.toFloat() / scrollState.maxValue.toFloat()).coerceIn(0f, 1f)
+                        } else 0f
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(2.5.dp),
+                    color = Color(0xFF64B5F6),
+                    trackColor = Color(0xFF282832)
                 )
             }
         }
@@ -286,6 +306,9 @@ fun MarkdownMessageView(
     modifier: Modifier = Modifier,
     isStreaming: Boolean = false
 ) {
+    val context = LocalContext.current
+    val clipboardManager = LocalClipboardManager.current
+
     // Check for thinking blocks: <think> ... </think>
     val thinkPattern = Regex("<think>([\\s\\S]*?)(</think>|$)", RegexOption.IGNORE_CASE)
     val thinkMatch = thinkPattern.find(text)
@@ -300,7 +323,15 @@ fun MarkdownMessageView(
     }
 
     val blocks = remember(cleanText) { parseMarkdownBlocks(cleanText) }
+    var manuallyToggled by remember { mutableStateOf(false) }
     var thinkExpanded by remember { mutableStateOf(isThinkingInProgress) }
+
+    // Auto-expand while generating thoughts, auto-collapse when thought finishes and code arrives
+    LaunchedEffect(isThinkingInProgress) {
+        if (!manuallyToggled) {
+            thinkExpanded = isThinkingInProgress
+        }
+    }
 
     Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(8.dp)) {
         // Thinking process collapsible section
@@ -309,7 +340,10 @@ fun MarkdownMessageView(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(8.dp))
-                    .clickable { thinkExpanded = !thinkExpanded },
+                    .clickable {
+                        manuallyToggled = true
+                        thinkExpanded = !thinkExpanded
+                    },
                 color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
                 border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
             ) {
@@ -325,11 +359,26 @@ fun MarkdownMessageView(
                             color = MaterialTheme.colorScheme.primary,
                             fontWeight = FontWeight.SemiBold
                         )
-                        Text(
-                            text = if (thinkExpanded) "▲ 收起" else "▼ 展开",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            if (!isThinkingInProgress && thinkContent.isNotBlank()) {
+                                Text(
+                                    text = "复制思考",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.tertiary,
+                                    modifier = Modifier
+                                        .padding(end = 10.dp)
+                                        .clickable {
+                                            clipboardManager.setText(AnnotatedString(thinkContent))
+                                            Toast.makeText(context, "已复制思考过程", Toast.LENGTH_SHORT).show()
+                                        }
+                                )
+                            }
+                            Text(
+                                text = if (thinkExpanded) "▲ 收起" else "▼ 展开",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
                     }
                     AnimatedVisibility(visible = thinkExpanded) {
                         Column(Modifier.padding(top = 8.dp)) {

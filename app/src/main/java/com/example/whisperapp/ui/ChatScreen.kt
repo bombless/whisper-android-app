@@ -249,8 +249,13 @@ fun ChatScreen(modifier: Modifier = Modifier) {
                                     }
                                     TextButton(
                                         onClick = {
-                                            clipboardManager.setText(AnnotatedString(text))
-                                            Toast.makeText(context, "已复制全部回复", Toast.LENGTH_SHORT).show()
+                                            val textToCopy = if (text.contains("</think>")) {
+                                                text.substringAfter("</think>").trim()
+                                            } else {
+                                                text
+                                            }
+                                            clipboardManager.setText(AnnotatedString(textToCopy))
+                                            Toast.makeText(context, "已复制回复内容", Toast.LENGTH_SHORT).show()
                                         },
                                         contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp),
                                         modifier = Modifier.height(26.dp)
@@ -352,7 +357,7 @@ private fun EmptyChatGreeting(
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("💬 LFM3 本地对话助手", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
             Text(
-                "现已支持：\n• 最大 4096 / 8192 词元长文本生成（解决红黑树等长代码截断问题）\n• 代码块高亮、横向滚动与一键复制\n• Markdown 粗体、列表、引用及思考过程格式化展示",
+                "现已支持：\n• CoT 深度思考引导：以「让我把完整的方案想清楚再输出」进行长链路规划\n• 最大 4096 / 8192 词元长文本生成（解决红黑树等复杂代码截断）\n• 代码块高亮、横向滚动与一键复制代码\n• 折叠式思考过程与 Markdown 渲染",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )

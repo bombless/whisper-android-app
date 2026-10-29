@@ -21,6 +21,7 @@ object QnnLfmChatRunner {
     private const val EXTERNAL_DATA_NAME = "model_q4.onnx_data"
     private const val EXTERNAL_DATA_SIZE = 1_625_944_064L
     const val DEFAULT_MAX_TOKENS = 4096
+    const val THINKING_PROMPT_PREFIX = "<think>让我把完整的方案想清楚再输出\n"
     private val CONV_LAYERS = intArrayOf(0, 1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23)
     private val KV_LAYERS = intArrayOf(2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22)
     private const val CONV_CHANNELS = 2048
@@ -136,7 +137,8 @@ object QnnLfmChatRunner {
         var inputIds = promptIds
         val generatedIds = ArrayList<Int>()
         var stopReason = "MAX_TOKENS_REACHED"
-        var lastDecodeText = ""
+        var lastDecodeText = THINKING_PROMPT_PREFIX
+        onToken?.invoke(lastDecodeText)
 
         for (step in 0 until maxTokens) {
             if (cancelRequested || isCancelled?.invoke() == true || Thread.currentThread().isInterrupted) {
@@ -199,7 +201,8 @@ object QnnLfmChatRunner {
                     }
 
                     // Decode streaming text for UI
-                    lastDecodeText = tok.decode(generatedIds.toIntArray())
+                    val decoded = tok.decode(generatedIds.toIntArray())
+                    lastDecodeText = if (decoded.startsWith("<think>")) decoded else (THINKING_PROMPT_PREFIX + decoded)
                     onToken?.invoke(lastDecodeText)
                 }
             } finally {
@@ -225,15 +228,26 @@ object QnnLfmChatRunner {
         session = null
     }
 
-    /** Mirrors the model's chat template, including BOS and direct response prompt without internal monologue. */
+    /** Mirrors the model's chat template, stripping old thinking and opening reasoning prompt. */
     private fun buildPrompt(history: List<Pair<String, String>>): String = buildString {
         append("<|startoftext|>")
         for ((role, content) in history) {
             append("<|im_start|>").append(role).append('\n')
-            append(content)
+            if (role == "assistant") {
+                // In official LFM3 Jinja template, prior assistant turns strip thinking:
+                val stripped = if (content.contains("</think>")) {
+                    "<think></think>" + content.substringAfter("</think>").trim()
+                } else {
+                    content
+                }
+                append(stripped)
+            } else {
+                append(content)
+            }
             append("<|im_end|>\n")
         }
-        append("<|im_start|>assistant\n<think>\n</think>")
+        append("<|im_start|>assistant\n")
+        append(THINKING_PROMPT_PREFIX)
     }
 
     private fun argmaxLastPosition(tensor: OnnxTensor): Int {
