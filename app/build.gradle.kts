@@ -5,7 +5,7 @@ plugins {
 }
 
 android {
-    namespace = "com.example.whisperapp"
+    namespace = "io.github.bombless.htp_playpen"
     compileSdk = 35
     ndkVersion = "25.2.9519653"
 
@@ -29,8 +29,8 @@ android {
         applicationId = "io.github.bombless.htp_playpen"
         minSdk = 29
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1"
+        versionCode = 2
+        versionName = "0.2.0"
 
         ndk {
             abiFilters += "arm64-v8a"

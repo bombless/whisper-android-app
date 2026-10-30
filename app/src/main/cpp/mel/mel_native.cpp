@@ -419,7 +419,7 @@ bool finalizeAndCopy(const float* mel, OutT* out) {
 // Declared in WhisperFeatureExtractor's companion object, so JNI mangles the names
 // with the _00024Companion infix.
 extern "C" JNIEXPORT jfloatArray JNICALL
-Java_com_example_whisperapp_audio_WhisperFeatureExtractor_00024Companion_nativeExtractFloat(
+Java_io_github_bombless_htp_playpen_audio_WhisperFeatureExtractor_00024Companion_nativeExtractFloat(
         JNIEnv* env, jobject /*thiz*/, jshortArray pcm, jint sampleRate) {
     if (sampleRate != kSampleRate) {
         LOGE("unsupported sample rate %d", sampleRate);
@@ -441,7 +441,7 @@ Java_com_example_whisperapp_audio_WhisperFeatureExtractor_00024Companion_nativeE
 }
 
 extern "C" JNIEXPORT jshortArray JNICALL
-Java_com_example_whisperapp_audio_WhisperFeatureExtractor_00024Companion_nativeExtractHalf(
+Java_io_github_bombless_htp_playpen_audio_WhisperFeatureExtractor_00024Companion_nativeExtractHalf(
         JNIEnv* env, jobject /*thiz*/, jshortArray pcm, jint sampleRate) {
     if (sampleRate != kSampleRate) {
         LOGE("unsupported sample rate %d", sampleRate);

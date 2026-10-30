@@ -3,7 +3,7 @@
 #include <jni.h>
 
 extern "C" JNIEXPORT jstring JNICALL
-Java_com_example_whisperapp_qnn_WhisperReferenceRunner_runNative(
+Java_io_github_bombless_htp_playpen_qnn_WhisperReferenceRunner_runNative(
         JNIEnv * env,
         jobject thiz,
         jshortArray pcm,
@@ -11,7 +11,7 @@ Java_com_example_whisperapp_qnn_WhisperReferenceRunner_runNative(
         jint threads);
 
 extern "C" JNIEXPORT jstring JNICALL
-Java_com_example_whisperapp_qnn_WhisperEncoderDiagnosticRunner_runNative(
+Java_io_github_bombless_htp_playpen_qnn_WhisperEncoderDiagnosticRunner_runNative(
         JNIEnv * env,
         jobject thiz,
         jshortArray pcm,

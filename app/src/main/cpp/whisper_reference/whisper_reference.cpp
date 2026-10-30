@@ -444,7 +444,7 @@ std::string run_encoder_diagnostic(const int16_t * samples, size_t sample_count,
 } // namespace
 
 extern "C" JNIEXPORT jstring JNICALL
-Java_com_example_whisperapp_qnn_WhisperReferenceRunner_runNative(
+Java_io_github_bombless_htp_playpen_qnn_WhisperReferenceRunner_runNative(
         JNIEnv * env,
         jobject,
         jshortArray pcm,
@@ -478,7 +478,7 @@ Java_com_example_whisperapp_qnn_WhisperReferenceRunner_runNative(
 }
 
 extern "C" JNIEXPORT jstring JNICALL
-Java_com_example_whisperapp_qnn_WhisperReferenceRunner_transcribeNative(JNIEnv * env, jobject, jshortArray pcm, jstring model_path, jint threads) {
+Java_io_github_bombless_htp_playpen_qnn_WhisperReferenceRunner_transcribeNative(JNIEnv * env, jobject, jshortArray pcm, jstring model_path, jint threads) {
     try {
         if (!pcm || !model_path) throw std::runtime_error("pcm/model_path is null");
         const jsize count = env->GetArrayLength(pcm);
@@ -505,7 +505,7 @@ Java_com_example_whisperapp_qnn_WhisperReferenceRunner_transcribeNative(JNIEnv *
     } catch (const std::exception & e) { return env->NewStringUTF((std::string("WHISPER_TRANSCRIBE_FAIL ") + e.what()).c_str()); }
 }
 extern "C" JNIEXPORT jstring JNICALL
-Java_com_example_whisperapp_qnn_WhisperEncoderDiagnosticRunner_runNative(
+Java_io_github_bombless_htp_playpen_qnn_WhisperEncoderDiagnosticRunner_runNative(
         JNIEnv * env, jobject, jshortArray pcm, jstring model_path, jint threads) {
     DIAG_LOG("ENCODER_JNI_START threads=%d", threads);
     try {

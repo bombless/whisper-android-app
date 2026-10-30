@@ -171,7 +171,7 @@ extern "C" {
 
 /** Points the native stage log at the same file the Kotlin side uses. */
 JNIEXPORT void JNICALL
-Java_com_example_whisperapp_qnn_QnnWhisperDecoderJni_nativeSetStageLog(JNIEnv* env, jclass,
+Java_io_github_bombless_htp_playpen_qnn_QnnWhisperDecoderJni_nativeSetStageLog(JNIEnv* env, jclass,
                                                                       jstring path) {
     if (path == nullptr) {
         g_stageLogPath.clear();
@@ -185,7 +185,7 @@ Java_com_example_whisperapp_qnn_QnnWhisperDecoderJni_nativeSetStageLog(JNIEnv* e
 
 /** Records the shared Java OrtEnvironment this session must attach to. */
 JNIEXPORT void JNICALL
-Java_com_example_whisperapp_qnn_QnnWhisperDecoderJni_nativeSetSharedEnv(JNIEnv*, jclass,
+Java_io_github_bombless_htp_playpen_qnn_QnnWhisperDecoderJni_nativeSetSharedEnv(JNIEnv*, jclass,
                                                                        jlong handle) {
     g_sharedEnv = reinterpret_cast<OrtEnv*>(handle);
     stageLog("shared_env_set handle=" + std::to_string(static_cast<long long>(handle)));
@@ -206,7 +206,7 @@ Java_com_example_whisperapp_qnn_QnnWhisperDecoderJni_nativeSetSharedEnv(JNIEnv*,
  * back to the Java decode loop.
  */
 JNIEXPORT jlong JNICALL
-Java_com_example_whisperapp_qnn_QnnWhisperDecoderJni_nativeCreate(
+Java_io_github_bombless_htp_playpen_qnn_QnnWhisperDecoderJni_nativeCreate(
     JNIEnv* env, jclass, jstring modelPath, jstring backendPath, jstring socModel,
     jstring htpArch, jstring perfMode, jstring pluginPath, jint nHeads, jint selfSlots,
     jint vocabSize) {
@@ -300,7 +300,7 @@ Java_com_example_whisperapp_qnn_QnnWhisperDecoderJni_nativeCreate(
 }
 
 JNIEXPORT jboolean JNICALL
-Java_com_example_whisperapp_qnn_QnnWhisperDecoderJni_nativeBindWindow(
+Java_io_github_bombless_htp_playpen_qnn_QnnWhisperDecoderJni_nativeBindWindow(
     JNIEnv* env, jclass, jlong handle, jshortArray crossKvFlat, jshortArray mask, jint position) {
     auto* state = reinterpret_cast<DecoderBinding*>(handle);
     if (!state || !state->binding) return JNI_FALSE;
@@ -423,7 +423,7 @@ Java_com_example_whisperapp_qnn_QnnWhisperDecoderJni_nativeBindWindow(
  * traffic to the two int32 scalars while preserving the exact Java semantics.
  */
 JNIEXPORT jboolean JNICALL
-Java_com_example_whisperapp_qnn_QnnWhisperDecoderJni_nativeStep(
+Java_io_github_bombless_htp_playpen_qnn_QnnWhisperDecoderJni_nativeStep(
     JNIEnv* env, jclass, jlong handle, jint inputToken, jint position, jshortArray logitsOut) {
     auto* state = reinterpret_cast<DecoderBinding*>(handle);
     if (!state || !state->bound) return JNI_FALSE;
@@ -533,19 +533,19 @@ Java_com_example_whisperapp_qnn_QnnWhisperDecoderJni_nativeStep(
 }
 
 JNIEXPORT jdouble JNICALL
-Java_com_example_whisperapp_qnn_QnnWhisperDecoderJni_nativeLastStepMs(JNIEnv*, jclass, jlong handle) {
+Java_io_github_bombless_htp_playpen_qnn_QnnWhisperDecoderJni_nativeLastStepMs(JNIEnv*, jclass, jlong handle) {
     auto* state = reinterpret_cast<DecoderBinding*>(handle);
     return state ? state->lastStepMs : 0.0;
 }
 
 JNIEXPORT jdouble JNICALL
-Java_com_example_whisperapp_qnn_QnnWhisperDecoderJni_nativeLastBindMs(JNIEnv*, jclass, jlong handle) {
+Java_io_github_bombless_htp_playpen_qnn_QnnWhisperDecoderJni_nativeLastBindMs(JNIEnv*, jclass, jlong handle) {
     auto* state = reinterpret_cast<DecoderBinding*>(handle);
     return state ? state->lastBindMs : 0.0;
 }
 
 JNIEXPORT jstring JNICALL
-Java_com_example_whisperapp_qnn_QnnWhisperDecoderJni_nativeDescribe(JNIEnv* env, jclass,
+Java_io_github_bombless_htp_playpen_qnn_QnnWhisperDecoderJni_nativeDescribe(JNIEnv* env, jclass,
                                                                    jlong handle) {
     auto* state = reinterpret_cast<DecoderBinding*>(handle);
     if (!state || !state->session) return env->NewStringUTF("uninitialized");
@@ -557,7 +557,7 @@ Java_com_example_whisperapp_qnn_QnnWhisperDecoderJni_nativeDescribe(JNIEnv* env,
 }
 
 JNIEXPORT void JNICALL
-Java_com_example_whisperapp_qnn_QnnWhisperDecoderJni_nativeClose(JNIEnv*, jclass, jlong handle) {
+Java_io_github_bombless_htp_playpen_qnn_QnnWhisperDecoderJni_nativeClose(JNIEnv*, jclass, jlong handle) {
     auto* state = reinterpret_cast<DecoderBinding*>(handle);
     if (!state) return;
     // Order matters: the binding references the session's allocators.
