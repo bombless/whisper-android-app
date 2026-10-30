@@ -285,98 +285,142 @@ fun ChatScreen(modifier: Modifier = Modifier) {
             color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
             border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
         ) {
-            Row(
+            Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
+                    .padding(horizontal = 12.dp, vertical = 8.dp)
             ) {
-                Column(Modifier.weight(1f)) {
-                    Text(
-                        "LFM3-1.7B · QNN HTP",
-                        style = MaterialTheme.typography.titleSmall,
-                        fontWeight = FontWeight.Bold,
-                        maxLines = 1
-                    )
-                    Text(
-                        if (currentSessionId != null) "会话：$currentSessionTitle" else status,
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-
+                // Row 1: Model Title on the left, History & New Chat on the right
                 Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    // New chat button
-                    IconButton(
-                        onClick = startNewChat,
-                        enabled = !busy && messages.isNotEmpty(),
-                        modifier = Modifier.size(32.dp)
+                    Row(
+                        modifier = Modifier.weight(1f, fill = false),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text("➕", fontSize = 13.sp)
-                    }
-
-                    // History button
-                    FilterChip(
-                        selected = showHistorySheet,
-                        onClick = {
-                            if (!busy) {
-                                refreshHistory()
-                                showHistorySheet = true
-                            }
-                        },
-                        label = { Text("📜 历史 (${historyList.size})", fontSize = 12.sp) },
-                        enabled = !busy,
-                        modifier = Modifier.height(32.dp)
-                    )
-
-                    // Max tokens selector dropdown
-                    Box {
-                        FilterChip(
-                            selected = true,
-                            onClick = { if (!busy) tokenMenuExpanded = true },
-                            label = { Text("$maxTokens 词 ▾", fontSize = 12.sp) },
-                            enabled = !busy,
-                            modifier = Modifier.height(32.dp)
+                        Text(
+                            "LFM3-1.7B · QNN HTP",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1
                         )
-                        DropdownMenu(
-                            expanded = tokenMenuExpanded,
-                            onDismissRequest = { tokenMenuExpanded = false }
-                        ) {
-                            tokenOptions.forEach { opt ->
-                                DropdownMenuItem(
-                                    text = {
-                                        Text(
-                                            "$opt 词元" + if (opt == maxTokens) " ✓" else "",
-                                            fontWeight = if (opt == maxTokens) FontWeight.Bold else FontWeight.Normal
-                                        )
-                                    },
-                                    onClick = {
-                                        maxTokens = opt
-                                        tokenMenuExpanded = false
-                                    }
-                                )
-                            }
+                        if (busy) {
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                "● 生成中",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.primary,
+                                fontWeight = FontWeight.Bold
+                            )
                         }
                     }
 
-                    // Clear screen button
-                    TextButton(
-                        onClick = {
-                            messages.clear()
-                            currentSessionId = null
-                            currentSessionTitle = "新对话"
-                        },
-                        enabled = !busy && messages.isNotEmpty(),
-                        modifier = Modifier.height(32.dp),
-                        contentPadding = PaddingValues(horizontal = 6.dp)
+                    // Top-right action buttons: History & New Chat
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        Text("清屏", style = MaterialTheme.typography.labelSmall)
+                        // History button
+                        FilterChip(
+                            selected = showHistorySheet,
+                            onClick = {
+                                if (!busy) {
+                                    refreshHistory()
+                                    showHistorySheet = true
+                                }
+                            },
+                            label = { Text("📜 历史 (${historyList.size})", fontSize = 12.sp) },
+                            enabled = !busy,
+                            modifier = Modifier.height(32.dp)
+                        )
+
+                        // New chat button
+                        OutlinedButton(
+                            onClick = startNewChat,
+                            enabled = !busy && messages.isNotEmpty(),
+                            modifier = Modifier.height(32.dp),
+                            contentPadding = PaddingValues(horizontal = 8.dp)
+                        ) {
+                            Text("➕ 新对话", fontSize = 12.sp)
+                        }
+                    }
+                }
+
+                Spacer(Modifier.height(6.dp))
+                HorizontalDivider(
+                    color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f),
+                    thickness = 0.5.dp
+                )
+                Spacer(Modifier.height(6.dp))
+
+                // Row 2: Current Session Title / Status on the left, Tokens & Clear on the right
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    // Session title or current status
+                    Text(
+                        text = if (currentSessionId != null) "会话：$currentSessionTitle" else status,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (currentSessionId != null) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier
+                            .weight(1f)
+                            .padding(end = 8.dp)
+                    )
+
+                    // Right action group: Max Tokens & Clear Screen
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        // Max tokens selector dropdown
+                        Box {
+                            FilterChip(
+                                selected = true,
+                                onClick = { if (!busy) tokenMenuExpanded = true },
+                                label = { Text("$maxTokens 词 ▾", fontSize = 12.sp) },
+                                enabled = !busy,
+                                modifier = Modifier.height(32.dp)
+                            )
+                            DropdownMenu(
+                                expanded = tokenMenuExpanded,
+                                onDismissRequest = { tokenMenuExpanded = false }
+                            ) {
+                                tokenOptions.forEach { opt ->
+                                    DropdownMenuItem(
+                                        text = {
+                                            Text(
+                                                "$opt 词元" + if (opt == maxTokens) " ✓" else "",
+                                                fontWeight = if (opt == maxTokens) FontWeight.Bold else FontWeight.Normal
+                                            )
+                                        },
+                                        onClick = {
+                                            maxTokens = opt
+                                            tokenMenuExpanded = false
+                                        }
+                                    )
+                                }
+                            }
+                        }
+
+                        // Clear screen button
+                        TextButton(
+                            onClick = {
+                                messages.clear()
+                                currentSessionId = null
+                                currentSessionTitle = "新对话"
+                            },
+                            enabled = !busy && messages.isNotEmpty(),
+                            modifier = Modifier.height(32.dp),
+                            contentPadding = PaddingValues(horizontal = 6.dp)
+                        ) {
+                            Text("清屏", style = MaterialTheme.typography.labelSmall)
+                        }
                     }
                 }
             }
