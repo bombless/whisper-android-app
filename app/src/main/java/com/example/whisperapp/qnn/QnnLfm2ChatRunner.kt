@@ -538,7 +538,6 @@ blurry, low quality, distorted
                                         responseText = LfmToolCallParser.formatImageToolResponse(
                                             success = true,
                                             filePath = savedFile.absolutePath,
-                                            prompt = prompt,
                                             error = null
                                         )
                                     } else {
@@ -547,7 +546,6 @@ blurry, low quality, distorted
                                         responseText = LfmToolCallParser.formatImageToolResponse(
                                             success = false,
                                             filePath = null,
-                                            prompt = prompt,
                                             error = err
                                         )
                                     }

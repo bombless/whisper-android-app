@@ -238,14 +238,12 @@ object LfmToolCallParser {
     fun formatImageToolResponse(
         success: Boolean,
         filePath: String?,
-        prompt: String,
-        error: String?
+        error: String? = null
     ): String = buildString {
         append("\n<tool_response>\n")
         if (success && filePath != null) {
             append("[状态] 图像生成成功 (1024 × 1024)\n")
             append("[图像路径] ").append(filePath).append("\n")
-            append("[提示词] ").append(prompt.take(120)).append("\n")
         } else {
             append("[执行失败] ").append(error ?: "未知错误").append("\n")
         }
