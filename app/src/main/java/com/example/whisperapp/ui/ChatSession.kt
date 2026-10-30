@@ -10,19 +10,24 @@ import java.util.UUID
 data class ChatMessage(
     val role: String, // "user" or "assistant"
     val content: String,
-    val timestamp: Long = System.currentTimeMillis()
+    val timestamp: Long = System.currentTimeMillis(),
+    val stats: String? = null
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("role", role)
         put("content", content)
         put("timestamp", timestamp)
+        if (stats != null) {
+            put("stats", stats)
+        }
     }
 
     companion object {
         fun fromJson(json: JSONObject): ChatMessage = ChatMessage(
             role = json.optString("role", "user"),
             content = json.optString("content", ""),
-            timestamp = json.optLong("timestamp", System.currentTimeMillis())
+            timestamp = json.optLong("timestamp", System.currentTimeMillis()),
+            stats = if (json.has("stats")) json.optString("stats") else null
         )
     }
 }

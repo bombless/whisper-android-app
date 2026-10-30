@@ -41,13 +41,15 @@ fun ChatScreen(modifier: Modifier = Modifier) {
     LaunchedEffect(Unit) { Log.i("CHAT_UI", "ChatScreen composed package=${context.packageName}") }
 
     val scope = rememberCoroutineScope()
-    val messages = remember { mutableStateListOf<Pair<String, String>>() }
+    val messages = remember { mutableStateListOf<ChatMessage>() }
     val listState = rememberLazyListState()
 
     var input by remember { mutableStateOf("") }
     var status by remember { mutableStateOf("正在准备 LFM3-1.7B…") }
     var busy by remember { mutableStateOf(false) }
     var currentJob by remember { mutableStateOf<Job?>(null) }
+    var currentSpeed by remember { mutableDoubleStateOf(0.0) }
+    var currentTokenCount by remember { mutableIntStateOf(0) }
 
     // Session & History state
     var currentSessionId by remember { mutableStateOf<String?>(null) }
@@ -98,19 +100,29 @@ fun ChatScreen(modifier: Modifier = Modifier) {
         QnnLfm2ChatRunner.cancelGeneration()
         currentJob?.cancel()
         busy = false
+        val finalTokens = currentTokenCount
+        val finalSpeed = currentSpeed
+        currentSpeed = 0.0
+        currentTokenCount = 0
         Log.i("CHAT_UI", "USER_STOPPED_GENERATION")
         // Persist whatever was received up to cancellation
         currentSessionId?.let { sId ->
+            if (messages.isNotEmpty() && messages.last().role == "assistant") {
+                val lastIdx = messages.lastIndex
+                val statsText = if (finalTokens > 0) {
+                    "${String.format(java.util.Locale.US, "%.1f", finalSpeed)} 词元/秒 · $finalTokens 词元 (已停止)"
+                } else null
+                messages[lastIdx] = messages[lastIdx].copy(stats = statsText)
+            }
             val snapshot = messages.toList()
             scope.launch(Dispatchers.IO) {
-                val chatMsgs = snapshot.map { ChatMessage(it.first, it.second) }
                 ChatHistoryManager.saveSession(
                     context,
                     ChatSession(
                         id = sId,
                         title = currentSessionTitle,
                         updatedAt = System.currentTimeMillis(),
-                        messages = chatMsgs
+                        messages = snapshot
                     )
                 )
                 val updated = ChatHistoryManager.listSessions(context)
@@ -127,6 +139,8 @@ fun ChatScreen(modifier: Modifier = Modifier) {
         currentSessionTitle = "新对话"
         messages.clear()
         input = ""
+        currentSpeed = 0.0
+        currentTokenCount = 0
         Toast.makeText(context, "已开启新对话", Toast.LENGTH_SHORT).show()
     }
 
@@ -141,9 +155,9 @@ fun ChatScreen(modifier: Modifier = Modifier) {
                     currentSessionId = loaded.id
                     currentSessionTitle = loaded.title
                     messages.clear()
-                    for (m in loaded.messages) {
-                        messages.add(m.role to m.content)
-                    }
+                    messages.addAll(loaded.messages)
+                    currentSpeed = 0.0
+                    currentTokenCount = 0
                     Toast.makeText(context, "已载入：${loaded.title}，可继续对话", Toast.LENGTH_SHORT).show()
                 } else {
                     Toast.makeText(context, "未能载入该对话", Toast.LENGTH_SHORT).show()
@@ -195,22 +209,23 @@ fun ChatScreen(modifier: Modifier = Modifier) {
                 currentSessionTitle
             }
 
-            messages += "user" to text
-            val historySnapshot = messages.toList()
-            messages += "assistant" to "正在思考…"
+            messages += ChatMessage("user", text)
+            val historySnapshot = messages.map { it.role to it.content }
+            messages += ChatMessage("assistant", "正在思考…")
             val assistantIndex = messages.lastIndex
             busy = true
+            currentSpeed = 0.0
+            currentTokenCount = 0
 
             // Immediately persist user prompt so it won't be lost
             scope.launch(Dispatchers.IO) {
-                val chatMessages = historySnapshot.map { ChatMessage(it.first, it.second) }
                 ChatHistoryManager.saveSession(
                     context,
                     ChatSession(
                         id = sessionId,
                         title = sessionTitle,
                         updatedAt = System.currentTimeMillis(),
-                        messages = chatMessages
+                        messages = messages.toList()
                     )
                 )
                 val updated = ChatHistoryManager.listSessions(context)
@@ -221,46 +236,63 @@ fun ChatScreen(modifier: Modifier = Modifier) {
             currentJob = scope.launch(Dispatchers.Default) {
                 var lastUiUpdateNs = 0L
                 val uiThrottleNs = 60_000_000L // 60ms throttle
+                var finalTokens = 0
+                var finalSpeed = 0.0
                 val answer = runCatching {
                     QnnLfm2ChatRunner.generate(
                         context = context,
                         history = historySnapshot,
                         maxTokens = maxTokens,
-                        isCancelled = { !isActive }
-                    ) { partialText ->
-                        val now = System.nanoTime()
-                        val isBoundary = partialText.endsWith('\n') || partialText.endsWith('。') || partialText.endsWith('！') || partialText.endsWith('？') || partialText.endsWith("```")
-                        if (isBoundary || now - lastUiUpdateNs >= uiThrottleNs) {
-                            lastUiUpdateNs = now
-                            launch(Dispatchers.Main) {
-                                if (assistantIndex in messages.indices) {
-                                    messages[assistantIndex] = "assistant" to partialText
+                        isCancelled = { !isActive },
+                        onProgress = { progress ->
+                            finalTokens = progress.tokenCount
+                            finalSpeed = progress.tokensPerSecond
+                            val now = System.nanoTime()
+                            val isBoundary = progress.isFinished || progress.text.endsWith('\n') || progress.text.endsWith('。') || progress.text.endsWith('！') || progress.text.endsWith('？') || progress.text.endsWith("```")
+                            if (isBoundary || now - lastUiUpdateNs >= uiThrottleNs) {
+                                lastUiUpdateNs = now
+                                launch(Dispatchers.Main) {
+                                    currentSpeed = progress.tokensPerSecond
+                                    currentTokenCount = progress.tokenCount
+                                    if (assistantIndex in messages.indices) {
+                                        messages[assistantIndex] = messages[assistantIndex].copy(
+                                            content = progress.text
+                                        )
+                                    }
                                 }
                             }
                         }
-                    }
+                    )
                 }.onFailure {
                     Log.e("CHAT_UI", "GENERATE_FAILED type=${it::class.java.name} message=${it.message}", it)
                 }.getOrElse { "生成失败：${it.message}" }
 
+                val statsText = if (finalTokens > 0) {
+                    "${String.format(java.util.Locale.US, "%.1f", finalSpeed)} 词元/秒 · $finalTokens 词元"
+                } else null
+
                 launch(Dispatchers.Main) {
                     if (assistantIndex in messages.indices) {
-                        messages[assistantIndex] = "assistant" to answer
+                        messages[assistantIndex] = messages[assistantIndex].copy(
+                            content = answer,
+                            stats = statsText
+                        )
                     }
                     busy = false
+                    currentSpeed = 0.0
+                    currentTokenCount = 0
                 }
 
                 // Persist full conversation with assistant reply
                 withContext(Dispatchers.IO) {
-                    val updatedMsgs = historySnapshot.map { ChatMessage(it.first, it.second) } +
-                        ChatMessage("assistant", answer)
+                    val snapshot = messages.toList()
                     ChatHistoryManager.saveSession(
                         context,
                         ChatSession(
                             id = sessionId,
                             title = sessionTitle,
                             updatedAt = System.currentTimeMillis(),
-                            messages = updatedMsgs
+                            messages = snapshot
                         )
                     )
                     val updated = ChatHistoryManager.listSessions(context)
@@ -271,7 +303,7 @@ fun ChatScreen(modifier: Modifier = Modifier) {
     }
 
     // Auto-scroll to bottom as new tokens arrive
-    LaunchedEffect(messages.size, messages.lastOrNull()?.second?.length) {
+    LaunchedEffect(messages.size, messages.lastOrNull()?.content?.length) {
         if (messages.isNotEmpty()) {
             listState.scrollToItem(messages.size - 1, scrollOffset = 100000)
         }
@@ -308,12 +340,34 @@ fun ChatScreen(modifier: Modifier = Modifier) {
                         )
                         if (busy) {
                             Spacer(Modifier.width(6.dp))
-                            Text(
-                                "● 生成中",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.primary,
-                                fontWeight = FontWeight.Bold
-                            )
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = MaterialTheme.colorScheme.primaryContainer,
+                                border = BorderStroke(0.5.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.4f))
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        "●",
+                                        fontSize = 8.sp,
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                    Spacer(Modifier.width(4.dp))
+                                    val statusSpeed = if (currentSpeed > 0.0) {
+                                        "${String.format(java.util.Locale.US, "%.1f", currentSpeed)} 词元/秒"
+                                    } else {
+                                        "生成中…"
+                                    }
+                                    Text(
+                                        statusSpeed,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+                            }
                         }
                     }
 
@@ -443,7 +497,10 @@ fun ChatScreen(modifier: Modifier = Modifier) {
                 }
             }
 
-            itemsIndexed(messages) { index, (role, text) ->
+            itemsIndexed(messages) { index, msg ->
+                val role = msg.role
+                val text = msg.content
+                val stats = msg.stats
                 val isAssistant = role == "assistant"
                 val isLastAssistant = isAssistant && (index == messages.lastIndex) && busy
 
@@ -467,7 +524,10 @@ fun ChatScreen(modifier: Modifier = Modifier) {
                                     horizontalArrangement = Arrangement.SpaceBetween,
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Row(
+                                        modifier = Modifier.weight(1f, fill = false),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
                                         Text(
                                             "🤖 LFM3",
                                             style = MaterialTheme.typography.labelSmall,
@@ -476,11 +536,42 @@ fun ChatScreen(modifier: Modifier = Modifier) {
                                         )
                                         if (isLastAssistant) {
                                             Spacer(Modifier.width(6.dp))
-                                            Text(
-                                                "正在输出…",
-                                                style = MaterialTheme.typography.labelSmall,
-                                                color = MaterialTheme.colorScheme.tertiary
-                                            )
+                                            Surface(
+                                                shape = RoundedCornerShape(10.dp),
+                                                color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.7f),
+                                                border = BorderStroke(0.5.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.3f))
+                                            ) {
+                                                Row(
+                                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                                                    verticalAlignment = Alignment.CenterVertically
+                                                ) {
+                                                    val speedDisplay = if (currentSpeed > 0.0) {
+                                                        "⚡ ${String.format(java.util.Locale.US, "%.1f", currentSpeed)} 词元/秒 ($currentTokenCount)"
+                                                    } else {
+                                                        "正在思考…"
+                                                    }
+                                                    Text(
+                                                        speedDisplay,
+                                                        style = MaterialTheme.typography.labelSmall,
+                                                        color = MaterialTheme.colorScheme.primary,
+                                                        fontWeight = FontWeight.SemiBold
+                                                    )
+                                                }
+                                            }
+                                        } else if (!stats.isNullOrBlank()) {
+                                            Spacer(Modifier.width(6.dp))
+                                            Surface(
+                                                shape = RoundedCornerShape(8.dp),
+                                                color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+                                            ) {
+                                                Text(
+                                                    "⚡ $stats",
+                                                    modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp),
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f),
+                                                    fontSize = 11.sp
+                                                )
+                                            }
                                         }
                                     }
                                     TextButton(

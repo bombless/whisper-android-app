@@ -19,13 +19,14 @@ class ChatHistoryManagerTest {
 
     @Test
     fun testChatMessageSerialization() {
-        val msg = ChatMessage("user", "Hello world! 测试消息", 123456789L)
+        val msg = ChatMessage("user", "Hello world! 测试消息", 123456789L, stats = "16.8 词元/秒 · 150 词元")
         val json = msg.toJson()
         val restored = ChatMessage.fromJson(json)
 
         assertEquals("user", restored.role)
         assertEquals("Hello world! 测试消息", restored.content)
         assertEquals(123456789L, restored.timestamp)
+        assertEquals("16.8 词元/秒 · 150 词元", restored.stats)
     }
 
     @Test
@@ -224,5 +225,23 @@ class ChatHistoryManagerTest {
         assertEquals("请给这棵红黑树添加删除节点的逻辑并自测", reloaded?.messages?.get(2)?.content)
         assertEquals("assistant", reloaded?.messages?.get(3)?.role)
         assertEquals("这是包含删除节点的完整实现及单元测试...", reloaded?.messages?.get(3)?.content)
+    }
+
+    @Test
+    fun testLfmGenerationProgressMetrics() {
+        val progress = com.example.whisperapp.qnn.LfmGenerationProgress(
+            text = "正在推理结果",
+            tokenCount = 50,
+            tokensPerSecond = 18.5,
+            elapsedMs = 2702L,
+            isFinished = false
+        )
+        assertEquals(50, progress.tokenCount)
+        assertEquals(18.5, progress.tokensPerSecond, 0.001)
+        assertEquals(2702L, progress.elapsedMs)
+        assertFalse(progress.isFinished)
+
+        val finishedProgress = progress.copy(isFinished = true)
+        assertTrue(finishedProgress.isFinished)
     }
 }

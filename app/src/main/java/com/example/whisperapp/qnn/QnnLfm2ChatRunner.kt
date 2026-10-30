@@ -16,6 +16,22 @@ import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import java.nio.LongBuffer
 
+/**
+ * Real-time generation progress and token throughput metrics.
+ * @param text Accumulated decoded text so far.
+ * @param tokenCount Number of tokens generated so far.
+ * @param tokensPerSecond Current generation speed in tokens per second (tok/s).
+ * @param elapsedMs Elapsed time since generation began in milliseconds.
+ * @param isFinished Whether the generation has completed.
+ */
+data class LfmGenerationProgress(
+    val text: String,
+    val tokenCount: Int,
+    val tokensPerSecond: Double,
+    val elapsedMs: Long,
+    val isFinished: Boolean = false
+)
+
 /** Native LFM3 runner: ONNX Runtime QNN EP + HTP, with no WebView/WASM. */
 object QnnLfmChatRunner {
     private const val TAG = "QNN_LFM3"
@@ -319,8 +335,9 @@ blurry, low quality, distorted
     }
 
     /**
-     * Generates assistant reply with streaming token support and optional JavaScript tool execution.
-     * @param onToken Called whenever new tokens are decoded; provides accumulated generated string.
+     * Generates assistant reply with streaming token support, token speed metrics, and optional tool execution.
+     * @param onProgress Called whenever new tokens are decoded; provides accumulated text and current speed (tok/s).
+     * @param onToken Optional callback receiving accumulated text only.
      */
     fun generate(
         context: Context,
@@ -328,6 +345,7 @@ blurry, low quality, distorted
         maxTokens: Int = DEFAULT_MAX_TOKENS,
         isCancelled: (() -> Boolean)? = null,
         enableTools: Boolean = true,
+        onProgress: ((progress: LfmGenerationProgress) -> Unit)? = null,
         onToken: ((partialText: String) -> Unit)? = null,
     ): String = synchronized(lock) {
         cancelRequested = false
@@ -357,7 +375,23 @@ blurry, low quality, distorted
         var toolExecutionCount = 0
         val maxToolCalls = 3
         val stepLatencies = ArrayList<Double>()
-        onToken?.invoke(lastDecodeText)
+        var currentSpeed = 0.0
+        var decodeStartedNs = 0L
+        var toolDowntimeNs = 0L
+
+        val dispatchProgress: (LfmGenerationProgress) -> Unit = { p ->
+            onProgress?.invoke(p)
+            onToken?.invoke(p.text)
+        }
+        dispatchProgress(
+            LfmGenerationProgress(
+                text = lastDecodeText,
+                tokenCount = 0,
+                tokensPerSecond = 0.0,
+                elapsedMs = 0L,
+                isFinished = false
+            )
+        )
 
         val powerManager = context.applicationContext.getSystemService(Context.POWER_SERVICE) as? PowerManager
         val wakeLock = powerManager?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "whisperapp:LFM3_INFERENCE")?.apply {
@@ -465,7 +499,28 @@ blurry, low quality, distorted
                         // Incremental streaming text decode
                         val streamText = streamDecoder.append(nextToken)
                         lastDecodeText = if (streamText.startsWith("<think>")) streamText else (THINKING_PROMPT_PREFIX + streamText)
-                        onToken?.invoke(lastDecodeText)
+                        val now = System.nanoTime()
+                        if (step == 0) {
+                            decodeStartedNs = now
+                        }
+                        val currentToks = generatedIds.size
+                        val elapsedMs = (now - startedNs) / 1_000_000L
+                        currentSpeed = if (step == 0) {
+                            if (elapsedMs > 0) currentToks * 1000.0 / elapsedMs else 0.0
+                        } else {
+                            val decodeElapsedMs = ((now - decodeStartedNs - toolDowntimeNs).coerceAtLeast(1_000_000L)) / 1_000_000.0
+                            val decodeToks = (currentToks - 1).coerceAtLeast(1)
+                            if (decodeElapsedMs > 0) decodeToks * 1000.0 / decodeElapsedMs else 0.0
+                        }
+                        dispatchProgress(
+                            LfmGenerationProgress(
+                                text = lastDecodeText,
+                                tokenCount = currentToks,
+                                tokensPerSecond = currentSpeed,
+                                elapsedMs = elapsedMs,
+                                isFinished = false
+                            )
+                        )
                         val decodeNs = System.nanoTime()
 
                         val prepMs = (prepNs - stepT0) / 1_000_000.0
@@ -482,9 +537,7 @@ blurry, low quality, distorted
                         OpTrace.record("lfm.step.total", "pipeline", totalStepMs)
 
                         if (step == 0 || step % 16 == 0 || nextToken == LfmTokenizer.EOS_ID) {
-                            val currentToks = generatedIds.size
-                            val totalElapsedMs = (System.nanoTime() - startedNs) / 1_000_000
-                            val speed = if (totalElapsedMs > 0) String.format("%.1f", currentToks * 1000.0 / totalElapsedMs) else "0.0"
+                            val speed = String.format(java.util.Locale.US, "%.1f", currentSpeed)
                             val heapMb = (Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory()) / (1024 * 1024)
                             LfmChatLogger.info(
                                 "STEP step=%4d tok=%6d seqLen=%3d pastLen=%4d | prep=%4.1fms run=%4.1fms ext=%4.1fms dec=%4.1fms total=%5.1fms | speed=%4s tok/s heap=%3dMB".format(
@@ -518,19 +571,37 @@ blurry, low quality, distorted
                                     val steps = toolCall.arguments["steps"]?.toIntOrNull()?.coerceIn(5, 50) ?: 20
                                     val seed = toolCall.arguments["seed"]?.toLongOrNull() ?: System.currentTimeMillis()
 
-                                    onToken?.invoke(lastDecodeText + "\n[🎨 本地 SDXL 神经生图引擎正在初始化…]\n")
+                                    val toolStartNs = System.nanoTime()
+                                    dispatchProgress(
+                                        LfmGenerationProgress(
+                                            text = lastDecodeText + "\n[🎨 本地 SDXL 神经生图引擎正在初始化…]\n",
+                                            tokenCount = generatedIds.size,
+                                            tokensPerSecond = currentSpeed,
+                                            elapsedMs = (System.nanoTime() - startedNs) / 1_000_000L,
+                                            isFinished = false
+                                        )
+                                    )
                                     val outputDir = File(context.filesDir, "generated_images").apply { mkdirs() }
                                     val outputFile = File(outputDir, "sdxl_${System.currentTimeMillis()}.png")
 
                                     val execResult = runCatching {
                                         val bitmap = SdxlEngine.generate(context, prompt, negPrompt, steps, seed) { progressMsg ->
-                                            onToken?.invoke(lastDecodeText + "\n[🎨 SDXL 绘图进度: $progressMsg]\n")
+                                            dispatchProgress(
+                                                LfmGenerationProgress(
+                                                    text = lastDecodeText + "\n[🎨 SDXL 绘图进度: $progressMsg]\n",
+                                                    tokenCount = generatedIds.size,
+                                                    tokensPerSecond = currentSpeed,
+                                                    elapsedMs = (System.nanoTime() - startedNs) / 1_000_000L,
+                                                    isFinished = false
+                                                )
+                                            )
                                         }
                                         outputFile.outputStream().use { out ->
                                             bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, out)
                                         }
                                         outputFile
                                     }
+                                    toolDowntimeNs += (System.nanoTime() - toolStartNs)
 
                                     if (execResult.isSuccess) {
                                         val savedFile = execResult.getOrThrow()
@@ -550,10 +621,20 @@ blurry, low quality, distorted
                                         )
                                     }
                                 } else {
-                                    onToken?.invoke(lastDecodeText + "\n[⚙️ JavaScript 运行时正在执行并测试代码...]\n")
+                                    val jsStartNs = System.nanoTime()
+                                    dispatchProgress(
+                                        LfmGenerationProgress(
+                                            text = lastDecodeText + "\n[⚙️ JavaScript 运行时正在执行并测试代码...]\n",
+                                            tokenCount = generatedIds.size,
+                                            tokensPerSecond = currentSpeed,
+                                            elapsedMs = (System.nanoTime() - startedNs) / 1_000_000L,
+                                            isFinished = false
+                                        )
+                                    )
                                     val execResult = OpTrace.time("lfm.tool.exec", "tools") {
                                         JsRuntime.execute(toolCall.code)
                                     }
+                                    toolDowntimeNs += (System.nanoTime() - jsStartNs)
                                     LfmChatLogger.info("TOOL_CALL_RESULT success=${execResult.success} timeMs=${execResult.executionTimeMs}ms error=${execResult.error}")
                                     responseText = LfmToolCallParser.formatToolResponse(execResult)
                                 }
@@ -649,7 +730,15 @@ blurry, low quality, distorted
                                     val fullDecoded = streamDecoder.text()
                                     lastDecodeText = if (fullDecoded.startsWith("<think>")) fullDecoded else (THINKING_PROMPT_PREFIX + fullDecoded)
                                     lastExecutedToolEnd = lastDecodeText.length
-                                    onToken?.invoke(lastDecodeText)
+                                    dispatchProgress(
+                                        LfmGenerationProgress(
+                                            text = lastDecodeText,
+                                            tokenCount = generatedIds.size,
+                                            tokensPerSecond = currentSpeed,
+                                            elapsedMs = (System.nanoTime() - startedNs) / 1_000_000L,
+                                            isFinished = false
+                                        )
+                                    )
                                 }
                             }
                         }
@@ -705,6 +794,16 @@ blurry, low quality, distorted
             "avg_speed" to avgSpeed,
             "stop_reason" to stopReason
         ))
+        val finalSpeed = decodeSpeed.toDoubleOrNull() ?: avgSpeed.toDoubleOrNull() ?: currentSpeed
+        dispatchProgress(
+            LfmGenerationProgress(
+                text = lastDecodeText,
+                tokenCount = generatedTokensCount,
+                tokensPerSecond = finalSpeed,
+                elapsedMs = totalElapsedMs,
+                isFinished = true
+            )
+        )
         return lastDecodeText
     }
 
