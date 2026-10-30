@@ -159,6 +159,9 @@ fun MainScreen() {
                 }
                 imageBitmap = generated
                 imageStatus = "生成完成（1024 × 1024）"
+                withContext(Dispatchers.IO) {
+                    ImageGenHistoryManager.saveItem(context, prompt, negativePrompt, generated)
+                }
             } catch (_: CancellationException) {
                 imageStatus = "已取消生成"
             } catch (failure: Throwable) {

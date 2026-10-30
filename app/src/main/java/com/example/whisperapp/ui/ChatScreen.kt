@@ -22,6 +22,7 @@ import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.whisperapp.qnn.QnnLfm2ChatRunner
@@ -29,6 +30,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.util.UUID
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -46,13 +49,29 @@ fun ChatScreen(modifier: Modifier = Modifier) {
     var busy by remember { mutableStateOf(false) }
     var currentJob by remember { mutableStateOf<Job?>(null) }
 
+    // Session & History state
+    var currentSessionId by remember { mutableStateOf<String?>(null) }
+    var currentSessionTitle by remember { mutableStateOf("新对话") }
+    var showHistorySheet by remember { mutableStateOf(false) }
+    var historyList by remember { mutableStateOf<List<ChatSessionSummary>>(emptyList()) }
+
     // Configurable Max Tokens: default 4096 (expanded from 1024)
     val tokenOptions = remember { listOf(1024, 2048, 4096, 8192) }
     var maxTokens by remember { mutableIntStateOf(4096) }
     var tokenMenuExpanded by remember { mutableStateOf(false) }
 
+    val refreshHistory: () -> Unit = {
+        scope.launch(Dispatchers.IO) {
+            val list = ChatHistoryManager.listSessions(context)
+            withContext(Dispatchers.Main) {
+                historyList = list
+            }
+        }
+    }
+
     LaunchedEffect(Unit) {
         status = QnnLfm2ChatRunner.start(context).message
+        refreshHistory()
     }
 
     val activity = context as? Activity
@@ -80,17 +99,123 @@ fun ChatScreen(modifier: Modifier = Modifier) {
         currentJob?.cancel()
         busy = false
         Log.i("CHAT_UI", "USER_STOPPED_GENERATION")
+        // Persist whatever was received up to cancellation
+        currentSessionId?.let { sId ->
+            val snapshot = messages.toList()
+            scope.launch(Dispatchers.IO) {
+                val chatMsgs = snapshot.map { ChatMessage(it.first, it.second) }
+                ChatHistoryManager.saveSession(
+                    context,
+                    ChatSession(
+                        id = sId,
+                        title = currentSessionTitle,
+                        updatedAt = System.currentTimeMillis(),
+                        messages = chatMsgs
+                    )
+                )
+                val updated = ChatHistoryManager.listSessions(context)
+                withContext(Dispatchers.Main) { historyList = updated }
+            }
+        }
+    }
+
+    val startNewChat: () -> Unit = {
+        if (busy) {
+            stopGeneration()
+        }
+        currentSessionId = null
+        currentSessionTitle = "新对话"
+        messages.clear()
+        input = ""
+        Toast.makeText(context, "已开启新对话", Toast.LENGTH_SHORT).show()
+    }
+
+    val loadSessionById: (String) -> Unit = { targetId ->
+        if (busy) {
+            stopGeneration()
+        }
+        scope.launch(Dispatchers.IO) {
+            val loaded = ChatHistoryManager.loadSession(context, targetId)
+            withContext(Dispatchers.Main) {
+                if (loaded != null) {
+                    currentSessionId = loaded.id
+                    currentSessionTitle = loaded.title
+                    messages.clear()
+                    for (m in loaded.messages) {
+                        messages.add(m.role to m.content)
+                    }
+                    Toast.makeText(context, "已载入：${loaded.title}，可继续对话", Toast.LENGTH_SHORT).show()
+                } else {
+                    Toast.makeText(context, "未能载入该对话", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+
+    val deleteSessionById: (String) -> Unit = { targetId ->
+        scope.launch(Dispatchers.IO) {
+            ChatHistoryManager.deleteSession(context, targetId)
+            val updated = ChatHistoryManager.listSessions(context)
+            withContext(Dispatchers.Main) {
+                historyList = updated
+                if (currentSessionId == targetId) {
+                    currentSessionId = null
+                    currentSessionTitle = "新对话"
+                    messages.clear()
+                }
+                Toast.makeText(context, "对话已删除", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    val clearAllHistory: () -> Unit = {
+        scope.launch(Dispatchers.IO) {
+            ChatHistoryManager.clearAll(context)
+            withContext(Dispatchers.Main) {
+                historyList = emptyList()
+                currentSessionId = null
+                currentSessionTitle = "新对话"
+                messages.clear()
+                Toast.makeText(context, "所有历史记录已清空", Toast.LENGTH_SHORT).show()
+            }
+        }
     }
 
     val sendText: (String) -> Unit = { rawPrompt ->
         val text = rawPrompt.trim()
         if (!busy && text.isNotBlank() && status.contains("已就绪")) {
             input = ""
+            val isNewSession = currentSessionId == null
+            val sessionId = currentSessionId ?: UUID.randomUUID().toString().also {
+                currentSessionId = it
+            }
+            val sessionTitle = if (isNewSession || currentSessionTitle == "新对话") {
+                ChatHistoryManager.generateTitle(text).also { currentSessionTitle = it }
+            } else {
+                currentSessionTitle
+            }
+
             messages += "user" to text
             val historySnapshot = messages.toList()
             messages += "assistant" to "正在思考…"
             val assistantIndex = messages.lastIndex
             busy = true
+
+            // Immediately persist user prompt so it won't be lost
+            scope.launch(Dispatchers.IO) {
+                val chatMessages = historySnapshot.map { ChatMessage(it.first, it.second) }
+                ChatHistoryManager.saveSession(
+                    context,
+                    ChatSession(
+                        id = sessionId,
+                        title = sessionTitle,
+                        updatedAt = System.currentTimeMillis(),
+                        messages = chatMessages
+                    )
+                )
+                val updated = ChatHistoryManager.listSessions(context)
+                withContext(Dispatchers.Main) { historyList = updated }
+            }
 
             Log.i("CHAT_UI", "SEND chars=${text.length} maxTokens=$maxTokens history=${historySnapshot.size}")
             currentJob = scope.launch(Dispatchers.Default) {
@@ -123,6 +248,23 @@ fun ChatScreen(modifier: Modifier = Modifier) {
                         messages[assistantIndex] = "assistant" to answer
                     }
                     busy = false
+                }
+
+                // Persist full conversation with assistant reply
+                withContext(Dispatchers.IO) {
+                    val updatedMsgs = historySnapshot.map { ChatMessage(it.first, it.second) } +
+                        ChatMessage("assistant", answer)
+                    ChatHistoryManager.saveSession(
+                        context,
+                        ChatSession(
+                            id = sessionId,
+                            title = sessionTitle,
+                            updatedAt = System.currentTimeMillis(),
+                            messages = updatedMsgs
+                        )
+                    )
+                    val updated = ChatHistoryManager.listSessions(context)
+                    withContext(Dispatchers.Main) { historyList = updated }
                 }
             }
         }
@@ -158,14 +300,41 @@ fun ChatScreen(modifier: Modifier = Modifier) {
                         maxLines = 1
                     )
                     Text(
-                        status,
+                        if (currentSessionId != null) "会话：$currentSessionTitle" else status,
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 1
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
 
-                Row(verticalAlignment = Alignment.CenterVertically) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    // New chat button
+                    IconButton(
+                        onClick = startNewChat,
+                        enabled = !busy && messages.isNotEmpty(),
+                        modifier = Modifier.size(32.dp)
+                    ) {
+                        Text("➕", fontSize = 13.sp)
+                    }
+
+                    // History button
+                    FilterChip(
+                        selected = showHistorySheet,
+                        onClick = {
+                            if (!busy) {
+                                refreshHistory()
+                                showHistorySheet = true
+                            }
+                        },
+                        label = { Text("📜 历史 (${historyList.size})", fontSize = 12.sp) },
+                        enabled = !busy,
+                        modifier = Modifier.height(32.dp)
+                    )
+
                     // Max tokens selector dropdown
                     Box {
                         FilterChip(
@@ -196,16 +365,18 @@ fun ChatScreen(modifier: Modifier = Modifier) {
                         }
                     }
 
-                    Spacer(Modifier.width(6.dp))
-
-                    // Clear button
+                    // Clear screen button
                     TextButton(
-                        onClick = { messages.clear() },
+                        onClick = {
+                            messages.clear()
+                            currentSessionId = null
+                            currentSessionTitle = "新对话"
+                        },
                         enabled = !busy && messages.isNotEmpty(),
                         modifier = Modifier.height(32.dp),
-                        contentPadding = PaddingValues(horizontal = 8.dp)
+                        contentPadding = PaddingValues(horizontal = 6.dp)
                     ) {
-                        Text("清空", style = MaterialTheme.typography.labelSmall)
+                        Text("清屏", style = MaterialTheme.typography.labelSmall)
                     }
                 }
             }
@@ -363,6 +534,18 @@ fun ChatScreen(modifier: Modifier = Modifier) {
             }
         }
     }
+
+    // Chat History Modal Bottom Sheet
+    ChatHistorySheet(
+        visible = showHistorySheet,
+        onDismiss = { showHistorySheet = false },
+        currentSessionId = currentSessionId,
+        sessions = historyList,
+        onSelectSession = loadSessionById,
+        onNewChat = startNewChat,
+        onDeleteSession = deleteSessionById,
+        onClearAll = clearAllHistory
+    )
 }
 
 @Composable
@@ -378,7 +561,7 @@ private fun EmptyChatGreeting(
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("💬 LFM3 本地对话助手", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
             Text(
-                "现已支持：\n• 🛠️ JavaScript 运行时与自主工具调用：模型可调用工具自测红黑树等算法\n• ⚡ 交互式代码测试：在任何 JavaScript 代码块上一键「▶ 运行 JS」并查看实时输出\n• 💭 CoT 深度思考过程折叠与复制\n• 📝 4096 / 8192 词元长文本生成与 Markdown 高亮",
+                "现已支持：\n• 🛠️ JavaScript 运行时与自主工具调用：模型可调用工具自测红黑树等算法\n• ⚡ 交互式代码测试：在任何 JavaScript 代码块上一键「▶ 运行 JS」并查看实时输出\n• 💭 CoT 深度思考过程折叠与复制\n• 📜 会话历史存储：随时查看往期记录并载入继续聊\n• 📝 4096 / 8192 词元长文本生成与 Markdown 高亮",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -406,7 +589,7 @@ private fun EmptyChatGreeting(
                     Text(
                         suggestion,
                         modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                        style = MaterialTheme.typography.bodySmall,
+                        style = MaterialTheme.bodySmall(MaterialTheme.typography.bodySmall),
                         color = if (ready) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline
                     )
                 }
@@ -414,3 +597,6 @@ private fun EmptyChatGreeting(
         }
     }
 }
+
+// Helper to keep style clean
+private fun MaterialTheme.bodySmall(base: androidx.compose.ui.text.TextStyle): androidx.compose.ui.text.TextStyle = base
