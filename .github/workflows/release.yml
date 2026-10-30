@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: '25.2.9519653'
+          link-to-sdk: true
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+
+      - name: Build Release APK
+        run: ./gradlew assembleRelease --stacktrace
+
+      - name: Locate and Rename APK
+        run: |
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          APK_DIR="app/build/outputs/apk/release"
+          
+          # Find generated apk
+          SRC_APK=$(find "$APK_DIR" -type f -name "*.apk" | head -n 1)
+          if [ -z "$SRC_APK" ]; then
+            echo "Error: Release APK not found in $APK_DIR"
+            exit 1
+          fi
+          
+          TARGET_APK="app/build/outputs/apk/release/htp-playpen-${TAG_NAME}.apk"
+          echo "Found APK: $SRC_APK -> $TARGET_APK"
+          cp "$SRC_APK" "$TARGET_APK"
+          echo "RELEASE_APK_PATH=$TARGET_APK" >> $GITHUB_ENV
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.RELEASE_APK_PATH }}
+          generate_release_notes: true
+          draft: false
+          prerelease: false

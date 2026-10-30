@@ -3,4 +3,4 @@
 	url = https://github.com/bombless/whisper.cpp.git
 [submodule "lib"]
 	path = lib
-	url = git@github.com:bombless/whisper-android-app-lib.git
+	url = https://github.com/bombless/whisper-android-app-lib.git
