@@ -8,66 +8,29 @@ android {
     namespace = "io.github.bombless.htp_playpen"
     compileSdk = 35
     ndkVersion = "25.2.9519653"
-
     packaging {
         jniLibs.useLegacyPackaging = true
-        jniLibs.pickFirsts += setOf(
-            "**/libsherpa-onnx-c-api.so",
-            "**/libsherpa-onnx-cxx-api.so",
-            "**/libsherpa-onnx-jni.so",
-        )
+        jniLibs.pickFirsts += setOf("**/libsherpa-onnx-c-api.so", "**/libsherpa-onnx-cxx-api.so", "**/libsherpa-onnx-jni.so")
     }
-
-    androidResources {
-        // Keep assets stored uncompressed. The QNN runner opens each context binary with
-        // AssetManager.openFd() to learn its real length and skip re-copying multi-GB
-        // binaries into cacheDir on every chunk; openFd is only available uncompressed.
-        noCompress += listOf("")
-    }
-
+    androidResources { noCompress += listOf("") }
     defaultConfig {
         applicationId = "io.github.bombless.htp_playpen"
         minSdk = 29
         targetSdk = 35
         versionCode = 2
         versionName = "0.2.0"
-
-        ndk {
-            abiFilters += "arm64-v8a"
-        }
-
-        externalNativeBuild {
-            cmake {
-                arguments += "-DANDROID_STL=c++_static"
-            }
-        }
+        ndk { abiFilters += "arm64-v8a" }
+        externalNativeBuild { cmake { arguments += "-DANDROID_STL=c++_static" } }
     }
-
-    externalNativeBuild {
-        cmake {
-            path = file("src/main/cpp/CMakeLists.txt")
-            version = "3.22.1"
-        }
-    }
-
-    buildTypes {
-        release { isMinifyEnabled = false }
-    }
-
+    externalNativeBuild { cmake { path = file("src/main/cpp/CMakeLists.txt"); version = "3.22.1" } }
+    buildTypes { release { isMinifyEnabled = false } }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
     kotlinOptions { jvmTarget = "17" }
     buildFeatures { compose = true }
-
-    testOptions {
-        // The mel caches log progress via android.util.Log, which the stub android.jar
-        // does not implement; without this every incremental-cache unit test throws
-        // "Method i in android.util.Log not mocked".
-        unitTests.isReturnDefaultValues = true
-    }
-
+    testOptions { unitTests.isReturnDefaultValues = true }
     sourceSets {
         getByName("main") {
             assets.srcDir(file("../lib/assets"))
@@ -77,6 +40,7 @@ android {
 }
 
 dependencies {
+    implementation(project(":shared-tools"))
     implementation("org.mozilla:rhino:1.9.1")
     implementation(fileTree(mapOf("dir" to "../lib/runtime", "include" to listOf("*.jar"))))
     implementation(files("../lib/runtime/sherpa-onnx-1.13.8-no-ort.aar"))

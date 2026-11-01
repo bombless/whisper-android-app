@@ -4,3 +4,6 @@
 [submodule "lib"]
 	path = lib
 	url = https://github.com/bombless/whisper-android-app-lib.git
+[submodule "shared-tools"]
+	path = shared-tools
+	url = https://github.com/bombless/android-agent-tools.git
