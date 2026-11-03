@@ -13,10 +13,11 @@ class SherpaOnnxTtsEngine(
     private val variant: Variant = Variant.PIPER_XIAO_YA_INT8,
 ) : TtsEngine {
     enum class Variant {
-        VITS_ZH_LL, PIPER_XIAO_YA_INT8;
+        VITS_ZH_LL, PIPER_XIAO_YA_INT8, KOKORO_MULTI_LANG;
         val displayName: String get() = when (this) {
             VITS_ZH_LL -> "VITS 中文（5 声线）"
             PIPER_XIAO_YA_INT8 -> "Piper 小雅（int8）"
+            KOKORO_MULTI_LANG -> "Kokoro 82M（中/日多语言）"
         }
     }
 
@@ -37,6 +38,7 @@ class SherpaOnnxTtsEngine(
                 }
                 ruleFsts = "$d/phone.fst,$d/date.fst,$d/number.fst"
             }
+            Variant.KOKORO_MULTI_LANG -> error("Kokoro is provided by KokoroOnnxTtsEngine")
             Variant.PIPER_XIAO_YA_INT8 -> {
                 val d = "models/tts/piper_xiao_ya_int8"
                 model.vits = OfflineTtsVitsModelConfig().apply {

@@ -32,11 +32,17 @@ import androidx.core.content.ContextCompat
 import io.github.bombless.htp_playpen.audio.AudioPlayer
 import io.github.bombless.htp_playpen.audio.LiveTranscriber
 import io.github.bombless.htp_playpen.audio.WhisperFeatureExtractor
+import io.github.bombless.htp_playpen.asr.AsrEngineFactory
+import io.github.bombless.htp_playpen.asr.SenseVoiceAsrEngine
+import io.github.bombless.htp_playpen.asr.SenseVoiceRecordingSession
+import io.github.bombless.htp_playpen.asr.SttEngineChoice
 import io.github.bombless.htp_playpen.asr.WhisperVariant
 import io.github.bombless.htp_playpen.qnn.QnnWhisperRealAudioRunner
 import io.github.bombless.htp_playpen.qnn.SdxlEngine
 import io.github.bombless.htp_playpen.tts.ChineseTextProcessor
+import io.github.bombless.htp_playpen.tts.KokoroOnnxTtsEngine
 import io.github.bombless.htp_playpen.tts.SherpaOnnxTtsEngine
+import io.github.bombless.htp_playpen.tts.TtsEngine
 import io.github.bombless.htp_playpen.tts.TtsQueue
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -69,7 +75,14 @@ fun MainScreen() {
     var ttsText by remember { mutableStateOf("") }
     var ttsStatus by remember { mutableStateOf("TTS 就绪") }
     var selectedTtsVariant by remember { mutableStateOf(SherpaOnnxTtsEngine.Variant.PIPER_XIAO_YA_INT8) }
+    var selectedTtsLanguage by remember { mutableStateOf(KokoroOnnxTtsEngine.LANGUAGE_AUTO) }
+    var selectedTtsVoice by remember { mutableStateOf(KokoroOnnxTtsEngine.VOICE_AUTO) }
     var ttsMenuExpanded by remember { mutableStateOf(false) }
+    var ttsVoiceMenuExpanded by remember { mutableStateOf(false) }
+    var kokoroEngine by remember { mutableStateOf<KokoroOnnxTtsEngine?>(null) }
+    var sttMenuExpanded by remember { mutableStateOf(false) }
+    var selectedSttEngine by remember { mutableStateOf(SttEngineChoice.WHISPER_QNN) }
+    var senseVoiceEngine by remember { mutableStateOf<SenseVoiceAsrEngine?>(null) }
     var recording by remember { mutableStateOf(false) }
     var processing by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf("") }
@@ -84,15 +97,74 @@ fun MainScreen() {
     // Set while recording; exposes ring-buffer drop counters to the diagnostics log.
     var liveTranscriber by remember { mutableStateOf<LiveTranscriber?>(null) }
     val audioPlayer = remember { AudioPlayer() }
-    fun createTtsQueue(variant: SherpaOnnxTtsEngine.Variant): TtsQueue = TtsQueue(scope, SherpaOnnxTtsEngine(context, variant), audioPlayer) { error ->
-        Log.e("WHISPER_TTS", "TTS failed variant=$variant: ${error.message}", error)
-        scope.launch(Dispatchers.Main) { ttsStatus = "TTS 失败: ${error.message ?: error::class.java.simpleName}" }
+    fun createTtsQueue(variant: SherpaOnnxTtsEngine.Variant): TtsQueue {
+        val engine: TtsEngine = if (variant == SherpaOnnxTtsEngine.Variant.KOKORO_MULTI_LANG) {
+            KokoroOnnxTtsEngine(context) { progress ->
+                scope.launch(Dispatchers.Main) {
+                    val percent = if (progress.totalBytes > 0L) {
+                        (progress.totalBytesDownloaded * 100L / progress.totalBytes).toInt().coerceIn(0, 100)
+                    } else 0
+                    ttsStatus = if (progress.completed == progress.totalFiles) {
+                        "Kokoro 模型已验证（24 kHz）"
+                    } else {
+                        "Kokoro 模型下载中 $percent% · ${progress.file}"
+                    }
+                }
+            }.also {
+                it.setLanguagePreference(selectedTtsLanguage)
+                it.setVoicePreference(selectedTtsVoice)
+                kokoroEngine = it
+            }
+        } else {
+            kokoroEngine = null
+            SherpaOnnxTtsEngine(context, variant)
+        }
+        return TtsQueue(scope, engine, audioPlayer) { error ->
+            Log.e("WHISPER_TTS", "TTS failed variant=$variant: ${error.message}", error)
+            scope.launch(Dispatchers.Main) { ttsStatus = "TTS 失败: ${error.message ?: error::class.java.simpleName}" }
+        }
     }
     var ttsQueue by remember { mutableStateOf<TtsQueue?>(null) }
     var ttsReady by remember { mutableStateOf(false) }
     var sttReady by remember { mutableStateOf(false) }
     var nativeSwitching by remember { mutableStateOf(true) }
     var switchJob by remember { mutableStateOf<Job?>(null) }
+
+    suspend fun loadSttEngine(choice: SttEngineChoice) {
+        sttReady = false
+        status = if (choice == SttEngineChoice.SENSEVOICE) "SenseVoice INT8 模型正在加载…" else "Whisper QNN native 正在加载…"
+        val prepared = AsrEngineFactory.prepare(context.applicationContext, choice, sttVariant)
+        senseVoiceEngine = prepared as? SenseVoiceAsrEngine
+        status = if (choice == SttEngineChoice.SENSEVOICE) "SenseVoice INT8 已就绪 · CPU · 离线识别" else "Whisper QNN 已就绪"
+        sttReady = true
+        Log.i("STT_ENGINE", "ENGINE_READY choice=$choice")
+    }
+
+    fun selectSttEngine(choice: SttEngineChoice) {
+        if (choice == selectedSttEngine) return
+        val previousChoice = selectedSttEngine
+        selectedSttEngine = choice
+        if (selectedTab != 1) return
+        switchJob?.cancel()
+        switchJob = scope.launch(Dispatchers.IO) {
+            nativeSwitching = true
+            try {
+                if (recording) {
+                    recording = false
+                    recordingJob?.cancelAndJoin()
+                    recordingJob = null
+                }
+                AsrEngineFactory.close(previousChoice, senseVoiceEngine)
+                senseVoiceEngine = null
+                loadSttEngine(choice)
+            } catch (failure: Throwable) {
+                Log.e("STT_ENGINE", "ENGINE_SWITCH_FAILED choice=$choice", failure)
+                withContext(Dispatchers.Main) { status = "STT 引擎切换失败：${failure.message ?: failure.javaClass.simpleName}" }
+            } finally {
+                nativeSwitching = false
+            }
+        }
+    }
 
     fun switchToTab(target: Int) {
         if (target == selectedTab || nativeSwitching || imageBusy) return
@@ -106,7 +178,10 @@ fun MainScreen() {
                     recordingJob = null
                     processing = false
                 }
-                if (selectedTab == 1) QnnWhisperRealAudioRunner.stop()
+                if (selectedTab == 1) {
+                    AsrEngineFactory.close(selectedSttEngine, senseVoiceEngine)
+                    senseVoiceEngine = null
+                }
                 ttsQueue?.clearAndStop()
                 ttsQueue?.closeAndWait()
                 ttsQueue = null
@@ -114,11 +189,8 @@ fun MainScreen() {
                 sttReady = false
                 withContext(Dispatchers.Main) { selectedTab = target }
                 if (target == 1) {
-                    status = "STT native 正在加载…"
-                    QnnWhisperRealAudioRunner.start(context, sttVariant)
-                    sttReady = true
-                    status = "STT 已就绪"
-                    Log.i("WHISPER_DIAG", "TAB_NATIVE_READY target=STT variant=${sttVariant.name}")
+                    loadSttEngine(selectedSttEngine)
+                    Log.i("WHISPER_DIAG", "TAB_NATIVE_READY target=STT engine=$selectedSttEngine variant=${sttVariant.name}")
                 } else if (target == 0) {
                     ttsStatus = "TTS native 正在加载…"
                     val queue = createTtsQueue(selectedTtsVariant)
@@ -195,6 +267,11 @@ fun MainScreen() {
         }
     }
 
+    LaunchedEffect(selectedTtsLanguage, selectedTtsVoice) {
+        kokoroEngine?.setLanguagePreference(selectedTtsLanguage)
+        kokoroEngine?.setVoicePreference(selectedTtsVoice)
+    }
+
     LaunchedEffect(Unit) {
         nativeSwitching = true
         try {
@@ -231,6 +308,38 @@ fun MainScreen() {
         ttsQueue?.clearAndStop()
         recording = true
         status = "正在监听…"
+        if (selectedSttEngine == SttEngineChoice.SENSEVOICE) {
+            val engine = senseVoiceEngine
+            if (engine == null) {
+                recording = false
+                status = "SenseVoice 尚未加载，请稍后重试"
+                return
+            }
+            val session = SenseVoiceRecordingSession(
+                context = context.applicationContext,
+                engine = engine,
+                scope = scope,
+                onResult = { result ->
+                    scope.launch(Dispatchers.Main) {
+                        transcript.add("${result.text}【${result.latencyMs}ms】")
+                        status = if (recording) "SenseVoice 正在监听…" else "已停止"
+                    }
+                },
+                onStatus = { message -> scope.launch(Dispatchers.Main) { status = message } },
+            )
+            recordingJob = session.start().also { job ->
+                job.invokeOnCompletion { failure ->
+                    if (failure != null && failure !is CancellationException) {
+                        scope.launch(Dispatchers.Main) {
+                            recording = false
+                            status = "SenseVoice 录音失败：${failure.message ?: failure.javaClass.simpleName}"
+                        }
+                    }
+                }
+            }
+            Log.i("STT_ENGINE", "SENSEVOICE_RECORDING_STARTED")
+            return
+        }
         recordingJob = scope.launch(Dispatchers.IO) {
             recordingLifecycleMutex.withLock {
             val rate = WhisperFeatureExtractor.SAMPLE_RATE
@@ -343,6 +452,8 @@ fun MainScreen() {
         onDispose {
             recordingJob?.cancel()
             scope.launch {
+                AsrEngineFactory.close(selectedSttEngine, senseVoiceEngine)
+                senseVoiceEngine = null
                 ttsQueue?.closeAndWait()
                 audioPlayer.release()
             }
@@ -409,12 +520,83 @@ fun MainScreen() {
                                 }
                             }
                         }
+                        if (selectedTtsVariant == SherpaOnnxTtsEngine.Variant.KOKORO_MULTI_LANG) {
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Text("语言", style = MaterialTheme.typography.labelLarge)
+                                FilterChip(
+                                    selected = selectedTtsLanguage == KokoroOnnxTtsEngine.LANGUAGE_AUTO,
+                                    onClick = { selectedTtsLanguage = KokoroOnnxTtsEngine.LANGUAGE_AUTO },
+                                    label = { Text("自动") },
+                                )
+                                FilterChip(
+                                    selected = selectedTtsLanguage == KokoroOnnxTtsEngine.LANGUAGE_CHINESE,
+                                    onClick = { selectedTtsLanguage = KokoroOnnxTtsEngine.LANGUAGE_CHINESE },
+                                    label = { Text("中文") },
+                                )
+                                FilterChip(
+                                    selected = selectedTtsLanguage == KokoroOnnxTtsEngine.LANGUAGE_JAPANESE,
+                                    onClick = { selectedTtsLanguage = KokoroOnnxTtsEngine.LANGUAGE_JAPANESE },
+                                    label = { Text("日本語") },
+                                )
+                            }
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Text("声线", style = MaterialTheme.typography.labelLarge)
+                                Box {
+                                    OutlinedButton(onClick = { ttsVoiceMenuExpanded = true }) {
+                                        Text(
+                                            when (selectedTtsVoice) {
+                                                KokoroOnnxTtsEngine.VOICE_JAPANESE -> "日本語 · jf_alpha"
+                                                KokoroOnnxTtsEngine.VOICE_CHINESE -> "中文 · zf_xiaobei"
+                                                else -> "自动切换"
+                                            },
+                                        )
+                                    }
+                                    DropdownMenu(
+                                        expanded = ttsVoiceMenuExpanded,
+                                        onDismissRequest = { ttsVoiceMenuExpanded = false },
+                                    ) {
+                                        DropdownMenuItem(
+                                            text = { Text("自动切换（按语言选择）") },
+                                            onClick = {
+                                                selectedTtsVoice = KokoroOnnxTtsEngine.VOICE_AUTO
+                                                ttsVoiceMenuExpanded = false
+                                            },
+                                        )
+                                        DropdownMenuItem(
+                                            text = { Text("日语 · jf_alpha") },
+                                            onClick = {
+                                                selectedTtsVoice = KokoroOnnxTtsEngine.VOICE_JAPANESE
+                                                ttsVoiceMenuExpanded = false
+                                            },
+                                        )
+                                        DropdownMenuItem(
+                                            text = { Text("中文 · zf_xiaobei") },
+                                            onClick = {
+                                                selectedTtsVoice = KokoroOnnxTtsEngine.VOICE_CHINESE
+                                                ttsVoiceMenuExpanded = false
+                                            },
+                                        )
+                                    }
+                                }
+                            }
+                            Text(
+                                "首次使用需联网下载约 167 MiB 模型；完成后可完全离线合成。",
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
                         Spacer(Modifier.height(20.dp))
                         OutlinedTextField(
                             value = ttsText,
                             onValueChange = { ttsText = it },
                             modifier = Modifier.fillMaxWidth().height(280.dp),
-                            placeholder = { Text("输入要朗读的中文文字") },
+                            placeholder = {
+                                Text(
+                                    if (selectedTtsVariant == SherpaOnnxTtsEngine.Variant.KOKORO_MULTI_LANG) {
+                                        "输入中文或日文（可含汉字、假名）"
+                                    } else "输入要朗读的中文文字",
+                                )
+                            },
                             label = { Text("朗读文本") },
                         )
                     }
@@ -443,6 +625,20 @@ fun MainScreen() {
                         }
                         Spacer(Modifier.height(8.dp))
                         Text(status, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Spacer(Modifier.height(10.dp))
+                        Box(Modifier.fillMaxWidth()) {
+                            OutlinedButton(enabled = !recording && !nativeSwitching, onClick = { sttMenuExpanded = true }, modifier = Modifier.fillMaxWidth()) {
+                                Text("STT 引擎：${selectedSttEngine.displayName}")
+                            }
+                            DropdownMenu(expanded = sttMenuExpanded, onDismissRequest = { sttMenuExpanded = false }) {
+                                SttEngineChoice.entries.forEach { choice ->
+                                    DropdownMenuItem(text = { Text(choice.displayName) }, onClick = {
+                                        sttMenuExpanded = false
+                                        selectSttEngine(choice)
+                                    })
+                                }
+                            }
+                        }
                         Spacer(Modifier.height(24.dp))
                         Surface(Modifier.fillMaxWidth().height(420.dp), shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.surfaceVariant) {
                             if (transcript.isEmpty()) {
@@ -467,7 +663,7 @@ fun MainScreen() {
                             colors = ButtonDefaults.buttonColors(containerColor = if (recording) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary)
                         ) { Text(if (recording) "停止转录" else "开始说话") }
                         Spacer(Modifier.height(8.dp))
-                        Text("${sttVariant.displayName} · 16 kHz", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelMedium)
+                        Text(if (selectedSttEngine == SttEngineChoice.SENSEVOICE) "SenseVoice INT8 · 16 kHz mono · Offline" else "${sttVariant.displayName} · 16 kHz · QNN", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelMedium)
                     }
                 }
             } else if (selectedTab == 2) {
